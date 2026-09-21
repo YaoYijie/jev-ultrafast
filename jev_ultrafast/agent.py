@@ -59,7 +59,16 @@ class Agent:
             except StalePage:
                 state["decision"] = None
                 state["status"] = "ready"
-                state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                browser = getattr(self, "browser", None) or state.get("browser")
+                deadline = time.monotonic() + 6.0
+                while True:
+                    try:
+                        state["page"] = browser.observe(screenshot=self.screenshots)
+                        break
+                    except StalePage as err:
+                        if time.monotonic() >= deadline or "navigating" not in str(err).lower():
+                            raise
+                        time.sleep(0.05)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
         elif name == "predict":

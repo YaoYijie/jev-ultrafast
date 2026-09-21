@@ -23,12 +23,12 @@
   };
   const roles=['button','link','checkbox','radio','switch','tab','menuitem','menuitemradio',
     'option','gridcell','combobox','textbox','searchbox','spinbutton'];
-  const selector='a[href],button,input,textarea,select,summary,[contenteditable="true"],'+
+  const selector='a[href],button,input,textarea,select,summary,[contenteditable="true"],[onclick],'+
     roles.map(role=>'[role="'+role+'"]').join(',');
   const role = e => {
     const explicit=e.getAttribute('role');
     if (roles.includes(explicit)) return explicit;
-    if (e.tagName==='BUTTON' || e.tagName==='SUMMARY') return 'button';
+    if (e.tagName==='BUTTON' || e.tagName==='SUMMARY' || e.hasAttribute('onclick')) return 'button';
     if (e.tagName==='A') return 'link';
     if (e.tagName==='SELECT') return 'combobox';
     if (e.tagName==='TEXTAREA' || e.isContentEditable) return 'textbox';
