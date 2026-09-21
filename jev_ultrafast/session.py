@@ -90,6 +90,7 @@ class Session:
         self.legs = [{"goal": goal, "started_at_step": 0}]
         self.archive: list[dict] = []
         self.pending_decision: dict | None = None
+        self.rechecked_blocked = False
         self.last_error: str | None = None
         self.closed = False
 
@@ -212,6 +213,17 @@ class Session:
 
                 decision = dict(agent.state["decision"])
                 page = agent.state["page"]
+                if (
+                    decision["choice"] == "BLOCKED"
+                    and not agent.state["history"]
+                    and not self.rechecked_blocked
+                ):
+                    # A leg that gives up before acting has usually just looked too early: results
+                    # a click away are still rendering. Look once more before believing it.
+                    self.rechecked_blocked = True
+                    time.sleep(1.5)
+                    self._reobserve()
+                    continue
                 chosen = next((a for a in page["actions"] if a["id"] == decision["choice"]), None)
                 soft = chosen is not None and chosen.get("kind") in SOFT_KINDS
                 if gated:
@@ -306,6 +318,7 @@ class Session:
             state["status"] = "ready"
             self.pending_decision = None
             self.legs.append({"goal": goal, "started_at_step": self.total_steps})
+            self.rechecked_blocked = False
             if not self.agent.browser.fresh(state["page"]):
                 self._reobserve()
             return self._report("retargeted", [])
@@ -338,6 +351,7 @@ class Session:
             state["status"] = "ready"
             state["page"] = browser.observe(screenshot=self.agent.screenshots)
             self.pending_decision = None
+            self.rechecked_blocked = False
             self.legs.append({"goal": state["goal"], "started_at_step": self.total_steps})
             return self._report("navigated", [])
 

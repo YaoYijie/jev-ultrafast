@@ -67,7 +67,13 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
     _say(f"需求: {need}")
     _say(f"监督模型: {supervisor.model_name()}    填值模型: {os.environ.get('TEXT_MODEL', '?')}")
     _say("规划中…")
-    plan = supervisor.plan(need, url)
+    try:
+        plan = supervisor.plan(need, url)
+    except Exception as exc:
+        if not url:
+            raise
+        _say(f"   ⚠ 规划失败（{type(exc).__name__}），退回单段模式。")
+        plan = {"start_url": url, "legs": [{"goal": need}]}
     legs = plan["legs"]
     for i, leg in enumerate(legs, 1):
         _say(f"   {i}. {leg['goal']}")
@@ -118,18 +124,24 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                     _say("      已拒绝，转交监督者处理。")
 
                 idle = idle + 1 if session.total_steps == before else 0
-                verdict = supervisor.judge(need, legs[index]["goal"], report, len(legs) - index - 1,
-                                           tried=sorted(tried), navigations_left=hops)
+                try:
+                    verdict = supervisor.judge(need, legs[index]["goal"], report, len(legs) - index - 1,
+                                               tried=sorted(tried), navigations_left=hops)
+                except Exception as exc:
+                    # Losing the supervisor must not throw away a browsing run that is going fine.
+                    _say(f"   ⚠ 监督模型调用失败（{type(exc).__name__}），本段到此为止。")
+                    break
                 _say(f"   ⟳ {verdict['action']}  {verdict['note']}")
                 if idle >= IDLE_CHECKPOINTS and verdict["action"] not in {"navigate", "finish"}:
                     _say(f"   ✗ 连续 {idle} 个检查点没有执行任何动作，放弃这一段。")
                     break
                 if verdict["action"] == "continue":
                     continue
-                if verdict["action"] == "continue" and stop in {"looping", "stalled"}:
-                    # The loop and stall detectors already proved more of the same goal does not
-                    # advance. "continue" here just re-enters the loop the detector caught.
-                    _say(f"   ⚠ {stop} 之后不能 continue，改为换目标。")
+                if verdict["action"] == "continue" and stop not in {"steps_exhausted", "stale_page"}:
+                    # More of the same goal cannot help here. The detectors already proved it for
+                    # looping and stalled, and after done or blocked the session refuses to step
+                    # at all until the goal is replaced, so "continue" executes literally nothing.
+                    _say(f"   ⚠ {stop} 之后 continue 不会执行任何动作，改为换目标。")
                     verdict["action"] = "retarget" if verdict["goal"] else "next"
                 if verdict["action"] == "force" and not pending:
                     # force only releases a held-back low-confidence choice. A weak supervisor
@@ -167,7 +179,11 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                 session.retarget(legs[index]["goal"])
 
         _say(f"\n共 {session.total_steps} 步，访问 {len(collected)} 个页面，汇总中…")
-        answer = supervisor.write_report(need, list(collected.values()))
+        try:
+            answer = supervisor.write_report(need, list(collected.values()))
+        except Exception as exc:
+            answer = (f"（汇总调用失败：{type(exc).__name__}。以下是实际访问到的页面，原文在 --json 记录里。）\n"
+                      + "\n".join(f"- {c['title']} — {c['url']}" for c in collected.values()))
     finally:
         sessions.finish(session.id)
 

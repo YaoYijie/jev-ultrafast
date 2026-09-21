@@ -7,6 +7,7 @@ coordinate or an element to click: those choices stay with Jev, on the elements 
 
 import json
 import os
+import re
 
 from .model import extra_headers, post_json
 
@@ -110,20 +111,39 @@ def _chat(system: str, payload, as_json: bool = True, max_tokens: int = 2048) ->
     if as_json:
         body["response_format"] = {"type": "json_object"}
     result = post_json(base + "/chat/completions", key, body,
-                       headers=extra_headers("SUPERVISOR", "TEXT_MODEL"))
+                       headers=extra_headers("SUPERVISOR", "TEXT_MODEL"),
+                       timeout=float(os.environ.get("SUPERVISOR_TIMEOUT", "90")))
     return result["choices"][0]["message"]["content"]
 
 
-def plan(need: str, url: str | None = None) -> dict:
-    raw = _chat(PLAN, {"need": need, "start_url": url})
-    out = json.loads(raw)
-    legs = [leg for leg in out.get("legs", []) if isinstance(leg, dict) and leg.get("goal")]
-    if not legs:
-        raise ValueError(f"Planner returned no legs: {raw[:200]}")
-    start = url or out.get("start_url")
-    if not start:
-        raise ValueError("Planner returned no start_url and none was given")
-    return {"start_url": start, "legs": legs[:8]}
+def _loads(raw: str) -> dict:
+    """JSON mode is a request, not a guarantee; a fenced or prefaced object still has to parse."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        match = re.search(r"\{.*\}", raw, re.S)
+        if not match:
+            raise ValueError(f"Supervisor returned no JSON object: {raw[:200]}") from None
+        return json.loads(match.group(0))
+
+
+def plan(need: str, url: str | None = None, attempts: int = 3) -> dict:
+    """A malformed plan is usually a one-off, and falling back to one huge leg wastes the run."""
+    last = None
+    for _ in range(attempts):
+        try:
+            raw = _chat(PLAN, {"need": need, "start_url": url})
+            out = _loads(raw)
+            legs = [leg for leg in out.get("legs", []) if isinstance(leg, dict) and leg.get("goal")]
+            if not legs:
+                raise ValueError(f"Planner returned no legs: {raw[:200]}")
+            start = url or out.get("start_url")
+            if not start:
+                raise ValueError("Planner returned no start_url and none was given")
+            return {"start_url": start, "legs": legs[:8]}
+        except ValueError as exc:
+            last = exc
+    raise last
 
 
 def judge(need: str, leg_goal: str, report: dict, remaining: int,
@@ -148,7 +168,10 @@ def judge(need: str, leg_goal: str, report: dict, remaining: int,
             "elements": observation.get("elements", [])[:25],
         },
     }
-    out = json.loads(_chat(JUDGE, payload))
+    try:
+        out = _loads(_chat(JUDGE, payload))
+    except ValueError:
+        out = _loads(_chat(JUDGE, payload))
     action = out.get("action")
     if action not in {"continue", "force", "retarget", "navigate", "next", "finish"}:
         action = "next"

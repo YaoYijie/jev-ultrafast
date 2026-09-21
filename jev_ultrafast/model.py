@@ -33,12 +33,17 @@ def extra_headers(*prefixes):
     return {}
 
 
-def post_json(url, key, body, headers=None):
+def post_json(url, key, body, headers=None, timeout=None):
     sent = {"Authorization": f"Bearer {key}", **(headers or {})}
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers=sent)
+            response = CLIENT.post(url, json=body, headers=sent, timeout=timeout or CLIENT.timeout)
         except httpx.HTTPError:
+            # Asking a model has no side effect, so a dropped or slow connection is safe to retry.
+            # A browser mutation still must not be: that rule lives at the call site, not here.
+            if attempt < 2:
+                time.sleep(0.5 * 2**attempt)
+                continue
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
             time.sleep(0.5 * 2**attempt)
