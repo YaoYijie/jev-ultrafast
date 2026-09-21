@@ -11,8 +11,8 @@ import os
 import sys
 import time
 
+from . import launcher, supervisor
 from . import session as sessions
-from . import supervisor
 
 CHECKPOINTS_PER_LEG = 6
 # Checkpoints that execute nothing are pure cost: one failed run spent 16 model calls and
@@ -38,6 +38,18 @@ def _ask(question: str) -> bool:
         return False
 
 
+def _refusal(index: int, report: dict, pending: dict, why: str) -> dict:
+    """What the gate stopped, in the report. An unattended run's whole value is saying this."""
+    return {
+        "leg": index + 1,
+        "why": why,
+        "operation": pending.get("operation"),
+        "target_label": pending.get("target_label"),
+        "gate_reason": pending.get("gate_reason"),
+        "url": report.get("observation", {}).get("url"),
+    }
+
+
 def _collect(store: dict, session) -> None:
     page = session.agent.state["page"]
     url = page.get("url")
@@ -61,15 +73,21 @@ def _show(report: dict, say=_say) -> None:
 
 
 def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
-        allow_commit: bool = True, say=None, ask=None) -> dict:
+        allow_commit: bool = True, say=None, ask=None, should_stop=None) -> dict:
     # The CLI talks to a terminal and the web UI talks to a browser; the loop itself should not
     # care which, and must never reach for stdin on its own.
     say = say or _say
     ask = ask or _ask
+    # A run started in the background needs a way out that is not killing the process; a cancelled
+    # run still reports, because the pages it already read are worth as much as before.
+    should_stop = should_stop or (lambda: False)
     started = time.time()
     sessions.load_env()
     say(f"需求: {need}")
     say(f"监督模型: {supervisor.model_name()}    填值模型: {os.environ.get('TEXT_MODEL', '?')}")
+    # Which browser this drives decides whether half the web is even reachable, so it is the
+    # first thing the log says rather than something to infer from a wall of login pages.
+    say(f"浏览器: {launcher.describe()['note']}")
     say("规划中…")
     try:
         plan = supervisor.plan(need, url)
@@ -90,13 +108,19 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
     approved = None
     index = 0
     finished = False
+    declined: list = []
 
     try:
         while index < len(legs) and session.total_steps < max_steps:
+            if should_stop():
+                say("\n✗ 已取消，用已经读到的页面汇总。")
+                break
             say(f"\n── leg {index + 1}/{len(legs)}: {legs[index]['goal']}")
             idle = 0
             hops = NAVIGATIONS_PER_LEG
             for _ in range(CHECKPOINTS_PER_LEG):
+                if should_stop():
+                    break
                 before = session.total_steps
                 report = session.step(steps=chunk, gated=True, approved=approved)
                 approved = None
@@ -112,6 +136,7 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                     say(f"   ⛔ {pending.get('gate_reason', '')}")
                     say("      这类字段不代填。请在 Chrome 里自己填好。")
                     if not ask("      填好了，继续这一段？"):
+                        declined.append(_refusal(index, report, pending, "字段涉及机密，不代填"))
                         break
                     continue
 
@@ -120,12 +145,14 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                     say(f"      动作: {pending.get('operation')} → {pending.get('target_label')}")
                     say(f"      页面: {report['observation']['url']}")
                     if not allow_commit:
-                        say("      --no-commit 模式，已拒绝。")
+                        say("      未获授权执行提交类动作，停在这里。")
+                        declined.append(_refusal(index, report, pending, "未获授权"))
                         break
                     if ask("      执行这个动作？"):
                         approved = pending.get("target_label")
                         continue
                     say("      已拒绝，转交监督者处理。")
+                    declined.append(_refusal(index, report, pending, "人工拒绝"))
 
                 idle = idle + 1 if session.total_steps == before else 0
                 try:
@@ -139,14 +166,14 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                 if idle >= IDLE_CHECKPOINTS and verdict["action"] not in {"navigate", "finish"}:
                     say(f"   ✗ 连续 {idle} 个检查点没有执行任何动作，放弃这一段。")
                     break
-                if verdict["action"] == "continue":
-                    continue
                 if verdict["action"] == "continue" and stop not in {"steps_exhausted", "stale_page"}:
                     # More of the same goal cannot help here. The detectors already proved it for
                     # looping and stalled, and after done or blocked the session refuses to step
                     # at all until the goal is replaced, so "continue" executes literally nothing.
                     say(f"   ⚠ {stop} 之后 continue 不会执行任何动作，改为换目标。")
                     verdict["action"] = "retarget" if verdict["goal"] else "next"
+                if verdict["action"] == "continue":
+                    continue
                 if verdict["action"] == "force" and not pending:
                     # force only releases a held-back low-confidence choice. A weak supervisor
                     # reaches for it to mean "type something else", which it cannot do.
@@ -199,6 +226,7 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
         "elapsed_s": round(time.time() - started, 1),
         "visited": list(collected.values()),
         "trace": trace,
+        "declined": declined,
         "answer": answer,
     }
 
@@ -217,6 +245,8 @@ def main():
 
     result = run(args.need, url=args.url, chunk=args.chunk, max_steps=args.max_steps,
                  allow_commit=not args.no_commit)
+    for item in result.get("declined", []):
+        _say(f"⛔ 未执行: {item['operation']} → {item['target_label']}  ({item['why']})  {item['url']}")
     if args.json_path:
         with open(args.json_path, "w", encoding="utf-8") as handle:
             json.dump(result, handle, ensure_ascii=False, indent=2)

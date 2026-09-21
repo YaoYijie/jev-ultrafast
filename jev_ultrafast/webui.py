@@ -3,76 +3,25 @@
 Same posture as the upstream inspector: bound to 127.0.0.1, Host and Origin checked, a per-process
 token injected into the page and required on every write, standard library only.
 
-It exists mostly for one thing a terminal cannot do well: the gate stops the run to ask before an
-action commits something, and that question has to reach whoever is actually watching.
+It exists mostly for one thing neither a terminal nor an MCP tool can do: the gate stops the run
+to ask before an action commits something, and that question has to reach a person. This is the
+only surface that can answer it — a run started from MCP is unwatched and declines instead.
 """
 
 import json
 import os
 import secrets
-import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from . import autopilot
+from . import runs
 
 ROOT = Path(__file__).parent
 PORT = int(os.environ.get("JEV_AUTO_PORT", "8767"))
 ORIGIN = f"http://127.0.0.1:{PORT}"
 TOKEN = secrets.token_urlsafe(32)
-
-LOCK = threading.Lock()
-ANSWERED = threading.Event()
-STATE = {"status": "idle", "lines": [], "question": None, "answer": None, "result": None, "error": None}
-
-
-def _reset():
-    # run() announces the need itself; adding it here printed it twice.
-    STATE.update(status="running", lines=[], question=None, answer=None, result=None, error=None)
-    ANSWERED.clear()
-
-
-def say(*parts):
-    line = " ".join(str(p) for p in parts)
-    with LOCK:
-        STATE["lines"].append(line)
-
-
-def ask(question):
-    """Block the run until the page answers. A closed page must not become a silent yes."""
-    with LOCK:
-        STATE["question"] = question.strip()
-        STATE["answer"] = None
-    ANSWERED.clear()
-    ANSWERED.wait()
-    with LOCK:
-        answer = bool(STATE["answer"])
-        STATE["question"] = None
-    return answer
-
-
-def _worker(params):
-    try:
-        result = autopilot.run(
-            params["need"],
-            url=params.get("url") or None,
-            chunk=int(params.get("chunk") or 6),
-            max_steps=int(params.get("max_steps") or 30),
-            allow_commit=bool(params.get("allow_commit")),
-            say=say,
-            ask=ask,
-        )
-        with LOCK:
-            STATE["result"] = result
-            STATE["status"] = "done"
-    except Exception as exc:
-        with LOCK:
-            STATE["error"] = f"{type(exc).__name__}: {exc}"
-            STATE["status"] = "error"
-    finally:
-        ANSWERED.set()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -89,22 +38,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+    def json(self, status, payload):
+        return self.send(status, json.dumps(payload, ensure_ascii=False))
+
     def _local(self):
         return self.headers.get("Host") == f"127.0.0.1:{PORT}"
 
     def do_GET(self):
         if not self._local():
             return self.send(403, "Forbidden", "text/plain")
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        path = parsed.path
+
         if path == "/api/state":
-            with LOCK:
-                return self.send(200, json.dumps({
-                    "status": STATE["status"],
-                    "lines": STATE["lines"],
-                    "question": STATE["question"],
-                    "result": STATE["result"],
-                    "error": STATE["error"],
-                }, ensure_ascii=False))
+            run_id = (query.get("run_id") or [""])[0]
+            if not run_id:
+                return self.json(200, {"status": "idle"})
+            try:
+                since = int((query.get("since") or ["0"])[0])
+            except ValueError:
+                since = 0
+            try:
+                return self.json(200, runs.poll(run_id, since=since))
+            except KeyError:
+                # Evicted from memory mid-poll; the finished record is still readable.
+                try:
+                    return self.json(200, {**runs.load(run_id), "next_line": 0, "question": None})
+                except KeyError:
+                    return self.json(404, {"error": "没有这个任务"})
+
+        if path == "/api/history":
+            return self.json(200, {"runs": runs.history(limit=30)})
+
+        if path == "/api/result":
+            run_id = (query.get("run_id") or [""])[0]
+            try:
+                return self.json(200, runs.load(run_id))
+            except KeyError:
+                return self.json(404, {"error": "没有这个任务"})
+
         if path != "/":
             return self.send(404, "Not found", "text/plain")
         page = (ROOT / "static" / "auto.html").read_text().replace("__TOKEN__", TOKEN)
@@ -116,34 +89,46 @@ class Handler(BaseHTTPRequestHandler):
             or self.headers.get("X-Jev-Token") != TOKEN
             or self.headers.get("Origin") not in (None, ORIGIN)
         ):
-            return self.send(403, json.dumps({"error": "Local requests only"}))
+            return self.json(403, {"error": "Local requests only"})
         length = int(self.headers.get("Content-Length") or 0)
         try:
             body = json.loads(self.rfile.read(length) or "{}")
         except ValueError:
-            return self.send(400, json.dumps({"error": "Bad JSON"}))
+            return self.json(400, {"error": "Bad JSON"})
         path = urlparse(self.path).path
 
         if path == "/api/start":
-            need = (body.get("need") or "").strip()
-            if not need:
-                return self.send(400, json.dumps({"error": "需求不能为空"}))
-            with LOCK:
-                if STATE["status"] == "running":
-                    return self.send(409, json.dumps({"error": "已有任务在运行"}))
-                _reset()
-            threading.Thread(target=_worker, args=(body,), daemon=True).start()
-            return self.send(200, json.dumps({"ok": True}))
+            try:
+                run = runs.start(
+                    body.get("need") or "",
+                    url=(body.get("url") or "").strip() or None,
+                    chunk=int(body.get("chunk") or 6),
+                    max_steps=int(body.get("max_steps") or 30),
+                    # Someone is looking at this page, so this run may ask before it commits.
+                    watched=True,
+                    allow_commit=bool(body.get("allow_commit")),
+                )
+            except ValueError as exc:
+                return self.json(400, {"error": str(exc)})
+            return self.json(200, {"ok": True, "run_id": run.id})
 
         if path == "/api/answer":
-            with LOCK:
-                if STATE["question"] is None:
-                    return self.send(409, json.dumps({"error": "当前没有待确认的动作"}))
-                STATE["answer"] = bool(body.get("approve"))
-            ANSWERED.set()
-            return self.send(200, json.dumps({"ok": True}))
+            try:
+                runs.get(body.get("run_id") or "").reply(bool(body.get("approve")))
+            except KeyError:
+                return self.json(404, {"error": "没有这个任务"})
+            except ValueError as exc:
+                return self.json(409, {"error": str(exc)})
+            return self.json(200, {"ok": True})
 
-        return self.send(404, json.dumps({"error": "Not found"}))
+        if path == "/api/cancel":
+            try:
+                runs.get(body.get("run_id") or "").cancel()
+            except KeyError:
+                return self.json(404, {"error": "没有这个任务"})
+            return self.json(200, {"ok": True})
+
+        return self.json(404, {"error": "Not found"})
 
 
 def main():
