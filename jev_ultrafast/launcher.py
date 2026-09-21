@@ -1,4 +1,11 @@
-"""Chrome process lifecycle manager for Jev Ultrafast automation."""
+"""Chrome process lifecycle manager for Jev Ultrafast automation.
+
+Two things here are easy to get wrong and expensive to debug. A port can be held by a process
+that answers the connection and nothing else, so reachability on a hardcoded host proves nothing.
+And a Chrome answering on the expected port is not necessarily the Chrome that was meant: attach
+to the wrong one and the run gets a clean profile that is logged into nothing, which looks like
+every site suddenly demanding a login rather than like a wiring mistake.
+"""
 
 import json
 import os
@@ -8,18 +15,33 @@ import time
 import urllib.request
 from pathlib import Path
 
+# One Chrome binds 127.0.0.1, the next finds IPv4 taken and binds [::1]. Both are "port 9222".
+CDP_HOSTS = ("127.0.0.1", "[::1]", "localhost")
+
+HARNESS_PROFILE = Path.home() / ".config" / "browser-harness" / "chrome-profile"
+
+
+def _version(base: str, timeout: float = 1.5) -> dict | None:
+    """The /json/version of a Chrome really speaking CDP at this base URL, else None."""
+    try:
+        with urllib.request.urlopen(f"{base}/json/version", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    return data if ("Browser" in data or "webSocketDebuggerUrl" in data) else None
+
+
+def cdp_endpoint(port: int = 9222) -> str | None:
+    """Base URL of whichever Chrome actually answers CDP on this port, or None."""
+    for host in CDP_HOSTS:
+        base = f"http://{host}:{port}"
+        if _version(base):
+            return base
+    return None
+
 
 def is_chrome_cdp_ready(port: int = 9222) -> bool:
-    for host in ["localhost", "127.0.0.1", "[::1]"]:
-        try:
-            req = urllib.request.Request(f"http://{host}:{port}/json/version")
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
-                data = json.loads(resp.read().decode())
-                if "Browser" in data or "webSocketDebuggerUrl" in data:
-                    return True
-        except Exception:
-            continue
-    return False
+    return cdp_endpoint(port) is not None
 
 
 def get_default_chrome_path() -> str:
@@ -51,56 +73,129 @@ def get_default_chrome_path() -> str:
     raise FileNotFoundError("Could not find Google Chrome binary on this system.")
 
 
-def get_user_chrome_port_file() -> Path | None:
+def default_user_data_dir() -> Path | None:
+    """Where the user's real Chrome keeps its profile: the one carrying their logins."""
     system = platform.system()
     if system == "Darwin":
-        p = Path.home() / "Library/Application Support/Google/Chrome/DevToolsActivePort"
-        if p.exists():
-            return p
-    elif system == "Linux":
-        p = Path.home() / ".config/google-chrome/DevToolsActivePort"
-        if p.exists():
-            return p
+        return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    if system == "Linux":
+        return Path.home() / ".config" / "google-chrome"
+    if system == "Windows":
+        return Path(os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data"))
+    return None
+
+
+def get_user_chrome_port_file() -> Path | None:
+    root = default_user_data_dir()
+    if root is None:
+        return None
+    port_file = root / "DevToolsActivePort"
+    return port_file if port_file.exists() else None
+
+
+def user_chrome_endpoint() -> str | None:
+    """The user's own Chrome, verified by identity rather than by port.
+
+    DevToolsActivePort holds a port and that browser's GUID. The port alone proves nothing: it
+    outlives the Chrome that wrote it, and a different Chrome is usually sitting on the same port
+    by then. Matching the GUID against webSocketDebuggerUrl is what makes this the user's browser
+    instead of whoever happened to answer.
+    """
+    port_file = get_user_chrome_port_file()
+    if port_file is None:
+        return None
+    try:
+        lines = port_file.read_text().splitlines()
+        port, guid = int(lines[0].strip()), lines[1].strip()
+    except (OSError, ValueError, IndexError):
+        return None
+    if not guid:
+        return None
+    for host in CDP_HOSTS:
+        base = f"http://{host}:{port}"
+        data = _version(base)
+        if data and str(data.get("webSocketDebuggerUrl", "")).endswith(guid):
+            return base
     return None
 
 
 def is_user_chrome_ready() -> bool:
-    port_file = get_user_chrome_port_file()
-    if not port_file:
-        return False
+    return user_chrome_endpoint() is not None
+
+
+def chosen_user_data_dir(profile_dir: str | None = None) -> Path:
+    """Which profile a launch should use.
+
+    JEV_CHROME_USER_DATA_DIR=user means the real, logged-in profile; a path means that path;
+    unset keeps the isolated harness profile, which is logged into nothing.
+    """
+    if profile_dir:
+        return Path(profile_dir).expanduser()
+    configured = (os.environ.get("JEV_CHROME_USER_DATA_DIR") or "").strip()
+    if not configured:
+        return HARNESS_PROFILE
+    if configured.lower() in {"user", "default", "real"}:
+        real = default_user_data_dir()
+        if real is None:
+            raise RuntimeError(
+                "JEV_CHROME_USER_DATA_DIR=user，但这个平台上找不到 Chrome 的默认 profile 目录。"
+                "请直接写绝对路径。")
+        return real
+    return Path(configured).expanduser()
+
+
+def profile_holder(user_data_dir: Path) -> str | None:
+    """Chrome locks a profile to one process; SingletonLock names who holds it."""
     try:
-        lines = port_file.read_text().splitlines()
-        if not lines:
-            return False
-        port = int(lines[0].strip())
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/json/version")
-        with urllib.request.urlopen(req, timeout=1.0) as resp:
-            data = json.loads(resp.read().decode())
-            return "Browser" in data or "webSocketDebuggerUrl" in data
-    except Exception:
-        return False
+        return os.readlink(user_data_dir / "SingletonLock")
+    except OSError:
+        return None
 
 
-def ensure_chrome_running(port: int = 9222, profile_dir: str | None = None, headless: bool = False) -> str:
-    """Ensures Chrome CDP is ready. Prioritizes user's already open Chrome profile."""
-    # 1. If user's existing Chrome has remote debugging turned on, use it directly!
-    if is_user_chrome_ready():
-        os.environ.pop("BU_CDP_URL", None)
-        return "user_default_chrome"
+def _relaunch_instructions(chrome_bin: str, port: int, profile: Path, holder: str | None) -> str:
+    held = f"（SingletonLock -> {holder}）" if holder else ""
+    return (
+        f"需要用这个 profile 的登录态，但它已经被一个没开远程调试的 Chrome 占着{held}：\n"
+        f"  {profile}\n"
+        f"Chrome 不允许两个进程共用一个 user-data-dir，所以只能先退出再带调试端口重开：\n"
+        f"  1. 完全退出 Chrome（Cmd-Q，确认没有残留进程）\n"
+        f'  2. "{chrome_bin}" --remote-debugging-port={port} &\n'
+        f"重开之后这里会自动认出它。"
+    )
 
-    endpoint = f"http://localhost:{port}"
-    os.environ["BU_CDP_URL"] = endpoint
 
-    if is_chrome_cdp_ready(port):
+def ensure_chrome_running(port: int = 9222, profile_dir: str | None = None,
+                          headless: bool = False) -> str:
+    """Ensure a CDP-speaking Chrome, preferring the profile that carries the user's logins."""
+    # 1. The user's own Chrome, identity-checked. Nothing beats this: it has the logins.
+    endpoint = user_chrome_endpoint()
+    if endpoint:
+        os.environ["BU_CDP_URL"] = endpoint
         return endpoint
 
     chrome_bin = get_default_chrome_path()
-    if not profile_dir:
-        profile_path = Path.home() / ".config" / "browser-harness" / "chrome-profile"
-    else:
-        profile_path = Path(profile_dir)
-    profile_path.mkdir(parents=True, exist_ok=True)
+    profile_path = chosen_user_data_dir(profile_dir)
+    real = default_user_data_dir()
+    wants_logins = real is not None and profile_path == real
 
+    # 2. Something else is on the port. Reusing it is right for a throwaway profile and wrong
+    #    when logins were asked for: a silent attach to the wrong Chrome is the whole bug.
+    endpoint = cdp_endpoint(port)
+    if endpoint and not wants_logins:
+        os.environ["BU_CDP_URL"] = endpoint
+        return endpoint
+    if endpoint:
+        raise RuntimeError(
+            f"{port} 端口上有 Chrome 在应答，但它不是你那个登录过的 profile（"
+            f"DevToolsActivePort 里的 GUID 对不上）。直接用它会得到一个什么都没登录的浏览器。\n"
+            + _relaunch_instructions(chrome_bin, port, profile_path, profile_holder(profile_path))
+        )
+
+    holder = profile_holder(profile_path)
+    if holder:
+        raise RuntimeError(_relaunch_instructions(chrome_bin, port, profile_path, holder))
+
+    profile_path.mkdir(parents=True, exist_ok=True)
     args = [
         chrome_bin,
         f"--remote-debugging-port={port}",
@@ -122,13 +217,41 @@ def ensure_chrome_running(port: int = 9222, profile_dir: str | None = None, head
 
     deadline = time.time() + 10
     while time.time() < deadline:
-        if is_chrome_cdp_ready(port):
+        endpoint = user_chrome_endpoint() if wants_logins else cdp_endpoint(port)
+        if endpoint:
+            os.environ["BU_CDP_URL"] = endpoint
             return endpoint
         time.sleep(0.3)
 
     raise RuntimeError(f"Chrome failed to start and bind CDP on port {port} within 10s.")
 
 
+def _note(connected: bool, wants_logins: bool) -> str:
+    """Three states, not two: configured for the real profile but unreachable is its own case."""
+    if connected:
+        return "在用你自己的 Chrome，登录态可用。"
+    if wants_logins:
+        return ("已配置成用你自己的 profile，但它现在没开远程调试，连不上。"
+                "退出 Chrome 后用 --remote-debugging-port=9222 重开即可。")
+    return "在用独立 profile，没有任何登录态；需要登录的站点会被门禁挡下。"
+
+
+def describe(port: int = 9222) -> dict:
+    """What a run is actually about to drive — above all, whether it has the user's logins."""
+    user = user_chrome_endpoint()
+    any_cdp = cdp_endpoint(port)
+    profile = chosen_user_data_dir()
+    real = default_user_data_dir()
+    return {
+        "endpoint": user or any_cdp,
+        "is_user_profile": bool(user),
+        "profile_dir": str(profile),
+        "profile_has_logins": real is not None and profile == real,
+        "port_answered_by_someone_else": bool(any_cdp and not user),
+        "note": _note(bool(user), real is not None and profile == real),
+    }
+
+
 if __name__ == "__main__":
-    url = ensure_chrome_running()
-    print(f"Chrome CDP active at {url}")
+    print(json.dumps(describe(), ensure_ascii=False, indent=2))
+    print(f"Chrome CDP active at {ensure_chrome_running()}")
