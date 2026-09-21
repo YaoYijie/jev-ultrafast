@@ -22,9 +22,11 @@ from .model import action_space
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / "artifacts" / "sessions"
 
-# Hand control back before Jev burns the run on guesses. 0.99 -> 0.37 with an unchanged URL is
-# the shape of a stuck run; both thresholds exist so the host sees it at step 2, not at step 6.
-MIN_CONFIDENCE = 0.55
+# Hand control back before Jev burns the run on guesses. A stuck run looks like 0.52, 0.48, 0.45,
+# 0.37 with the page never changing, so the stall limit is the primary signal and the confidence
+# floor only catches wild guesses: on a real goal, correct choices are observed as low as 0.42,
+# while the ones worth stopping sit near 0.2. A floor above ~0.4 interrupts decisions that are right.
+MIN_CONFIDENCE = 0.35
 STALL_LIMIT = 2
 STEP_BUDGET = 40
 STALE_RETRIES = 3
@@ -279,6 +281,27 @@ class Session:
                     report["close_error"] = str(exc)
             return report
 
+    def _granularity_advice(self, stop_reason: str, executed: list[dict]) -> str | None:
+        """Tell the host when its sub-goal left Jev nothing to choose.
+
+        A leg that ends after one near-certain action is the shape of a goal that named the element
+        instead of the outcome. Jev confirms rather than decides, and the host is back to doing the
+        choosing it delegated.
+        """
+        if stop_reason != "done":
+            return None
+        actions = [e for e in executed if "step" in e]
+        if len(actions) > 1 or not actions:
+            return None
+        if min(a["confidence"] for a in actions) < 0.95:
+            return None
+        return (
+            "This leg finished in a single near-certain action, which usually means the sub-goal "
+            "named the element to click instead of the page state to reach — Jev confirmed a choice "
+            "you had already made. Give the next leg an outcome to reach and more steps, and let "
+            "Jev find the way there."
+        )
+
     def brief(self, stop_reason: str = "retargeted") -> dict:
         """The same report a step returns, without executing anything."""
         with self.lock:
@@ -300,6 +323,9 @@ class Session:
             "observation": self.observation(),
             "next": NEXT_HINTS.get(stop_reason, NEXT_HINTS["steps_exhausted"]),
         }
+        advice = self._granularity_advice(stop_reason, executed)
+        if advice:
+            report["advice"] = advice
         if self.pending_decision:
             report["pending_decision"] = self.pending_decision
         if self.last_error:

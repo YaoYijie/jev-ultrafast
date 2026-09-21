@@ -30,9 +30,12 @@ def _fail(exc: Exception) -> str:
 def ultrafast_start(url: str, goal: str) -> str:
     """Open a supervised Jev browsing session on a live Chrome tab and observe the first page.
 
-    This executes nothing yet. Give one atomic sub-goal, not a whole research task: Jev chooses
-    among the elements it can see, so 'open the HR policy category' works and 'find everything
-    that affects me' does not. Plan the legs yourself and use ultrafast_retarget between them.
+    This executes nothing yet. Give a goal that names the page state you want to reach on this
+    site, not the element to click: Jev's job is to map that intent onto the elements it can see.
+    'Open the HR policy category and page through the whole list' works. 'Click the 人力资源类
+    button' wastes it — if you already know the element, Jev has nothing to decide. 'Find
+    everything that affects me' is too big, because Jev does not plan across pages.
+    Plan the legs yourself and use ultrafast_retarget between them.
 
     Args:
         url: Starting URL.
@@ -52,7 +55,7 @@ def ultrafast_start(url: str, goal: str) -> str:
 @mcp.tool()
 def ultrafast_step(
     session_id: str,
-    steps: int = 3,
+    steps: int = 6,
     min_confidence: float = MIN_CONFIDENCE,
     stall_limit: int = STALL_LIMIT,
     force: bool = False,
@@ -65,7 +68,9 @@ def ultrafast_step(
 
     Args:
         session_id: From ultrafast_start.
-        steps: Maximum actions to execute before handing back (keep it small, 2-5).
+        steps: Maximum actions to execute before handing back. Use 6-8 for a real leg; drop to
+            2-3 only when first probing an unfamiliar page. A leg that keeps ending after one
+            action means the goal is too narrow, not that steps is too high.
         min_confidence: Confidence floor below which Jev's choice is shown, not executed.
         stall_limit: Hand back after this many consecutive actions that do not change the page.
         force: Execute the next choice even if it is below the floor. Use only after reading a
