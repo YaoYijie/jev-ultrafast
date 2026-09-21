@@ -32,6 +32,9 @@ STALL_LIMIT = 2
 # page_changed cannot see that nothing is advancing. Repeating one choice is the other stall.
 REPEAT_LIMIT = 3
 STEP_BUDGET = 40
+# Scrolling and waiting neither navigate nor mutate, and reading a long list is mostly scrolling.
+# Holding those back on confidence costs a round trip for nothing; running out of page stops them.
+SOFT_KINDS = {"scroll", "wait"}
 STALE_RETRIES = 3
 
 MAX_LIVE_SESSIONS = 4
@@ -125,7 +128,7 @@ class Session:
         return count
 
     def _trailing_repeat(self) -> int:
-        history = [h for h in self.agent.state["history"] if h.get("kind") != "wait"]
+        history = [h for h in self.agent.state["history"] if h.get("kind") not in SOFT_KINDS]
         if not history:
             return 0
         label = history[-1].get("action")
@@ -196,14 +199,22 @@ class Session:
                     self._reobserve()
                     continue
                 except (ValueError, RuntimeError) as exc:
+                    # Choosing has no side effect, so a dropped connection is safe to retry here.
+                    if "connection failed" in str(exc).lower() and retries < STALE_RETRIES:
+                        retries += 1
+                        time.sleep(0.4 * retries)
+                        continue
                     stop, self.last_error = "error", str(exc)
                     break
 
                 decision = dict(agent.state["decision"])
                 page = agent.state["page"]
-                terminal = decision["choice"] in {"DONE", "BLOCKED"}
-                if not terminal and not force and decision["confidence"] < min_confidence:
-                    # Do not execute a guess. Show the host what Jev wanted and let it decide.
+                chosen = next((a for a in page["actions"] if a["id"] == decision["choice"]), None)
+                soft = chosen is not None and chosen.get("kind") in SOFT_KINDS
+                if not force and not soft and decision["confidence"] < min_confidence:
+                    # Do not act on a guess, and that includes giving up: Jev is measurably less
+                    # sure when it says DONE (median 0.49) than when it clicks (median 0.93), so
+                    # exempting terminals ended legs after one action on a 0.16 "done".
                     stop = "low_confidence"
                     self.pending_decision = _decision_view(decision, page)
                     break
@@ -355,7 +366,9 @@ NEXT_HINTS = {
     "steps_exhausted": "Jev is still making progress. Call ultrafast_step again to continue.",
     "low_confidence": "Jev's next choice is below the confidence floor and was NOT executed. Read "
     "pending_decision and elements: call ultrafast_step(force=true) to let it through, "
-    "ultrafast_retarget with a narrower sub-goal, or ultrafast_finish.",
+    "ultrafast_retarget with a narrower sub-goal, or ultrafast_finish. When the held-back "
+    "operation is DONE, Jev is unsure the goal is actually satisfied — check the page before "
+    "accepting it, and prefer retargeting the rest of the goal over forcing.",
     "stalled": "The page stopped changing. Retarget with a narrower sub-goal, or finish and start "
     "a new session from a more specific URL.",
     "looping": "Jev chose the same element several times in a row without advancing — often a link "
