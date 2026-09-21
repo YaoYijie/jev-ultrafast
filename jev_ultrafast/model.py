@@ -26,7 +26,13 @@ def extra_headers(*prefixes):
         try:
             value = json.loads(raw)
         except ValueError:
-            raise ValueError(f"{prefix}_HEADERS must be a JSON object") from None
+            # `uv run --env-file` strips unquoted double quotes, so a JSON object written bare in
+            # .env arrives as {k:v}. Repairing that by guessing would also accept config that is
+            # genuinely wrong, so say what to write instead.
+            raise ValueError(
+                f"{prefix}_HEADERS must be a JSON object, got {raw!r}. If the quotes are gone, "
+                f"wrap the whole value in single quotes in .env: {prefix}_HEADERS='{{\"k\": \"v\"}}'"
+            ) from None
         if not isinstance(value, dict):
             raise ValueError(f"{prefix}_HEADERS must be a JSON object")
         return {str(k): str(v) for k, v in value.items()}

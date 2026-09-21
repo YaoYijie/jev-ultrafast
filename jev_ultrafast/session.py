@@ -55,7 +55,12 @@ def load_env() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+        value = value.strip()
+        # A value may be wrapped in quotes so that `uv run --env-file` keeps the quotes inside it;
+        # read directly, those wrappers are not part of the value.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key.strip(), value)
 
 
 def _decision_view(decision: dict, page: dict) -> dict:
