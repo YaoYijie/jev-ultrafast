@@ -14,6 +14,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import guard
 from .agent import Agent
 from .browser import StalePage
 from .launcher import ensure_chrome_running
@@ -168,6 +169,8 @@ class Session:
         min_confidence: float = MIN_CONFIDENCE,
         stall_limit: int = STALL_LIMIT,
         force: bool = False,
+        gated: bool = False,
+        approved: str | None = None,
     ) -> dict:
         """Let Jev decide and act up to `steps` times, stopping early at anything worth a look."""
         with self.lock:
@@ -211,6 +214,14 @@ class Session:
                 page = agent.state["page"]
                 chosen = next((a for a in page["actions"] if a["id"] == decision["choice"]), None)
                 soft = chosen is not None and chosen.get("kind") in SOFT_KINDS
+                if gated:
+                    verdict, reason = guard.gate(decision, chosen, page)
+                    approved_this = approved is not None and chosen is not None and approved == chosen.get("label")
+                    if verdict == guard.BLOCK or (verdict == guard.CONFIRM and not approved_this):
+                        stop = "blocked_action" if verdict == guard.BLOCK else "needs_confirmation"
+                        self.pending_decision = {**_decision_view(decision, page), "gate_reason": reason}
+                        break
+                    approved = None
                 if not force and not soft and decision["confidence"] < min_confidence:
                     # Do not act on a guess, and that includes giving up: Jev is measurably less
                     # sure when it says DONE (median 0.49) than when it clicks (median 0.93), so
@@ -299,6 +310,37 @@ class Session:
                 self._reobserve()
             return self._report("retargeted", [])
 
+    def navigate(self, url: str, goal: str | None = None) -> dict:
+        """Point the same tab at a different site.
+
+        Retargeting can only restate the goal for the page you are on. When the site itself cannot
+        do the job, a supervisor that can only retarget will say so forever and never move.
+        """
+        with self.lock:
+            if self.closed:
+                raise ValueError(f"Session {self.id} is closed. Start a new one.")
+            url = url.strip()
+            if not url.startswith(("http://", "https://")):
+                raise ValueError("navigate needs an http(s) URL")
+            self.touched_at = time.time()
+            browser = self.agent.browser
+            state = self.agent.state
+            self.archive.append({"goal": state["goal"], "history": list(state["history"])})
+            state["history"] = []
+            if goal and goal.strip():
+                state["goal"] = goal.strip()
+                state["plan"] = [state["goal"]]
+                state["plan_index"] = 0
+            browser.after_input = None
+            browser.call("Page.navigate", url=url)
+            browser.settle()
+            state["decision"] = None
+            state["status"] = "ready"
+            state["page"] = browser.observe(screenshot=self.agent.screenshots)
+            self.pending_decision = None
+            self.legs.append({"goal": state["goal"], "started_at_step": self.total_steps})
+            return self._report("navigated", [])
+
     def close(self) -> dict:
         with self.lock:
             report = self._report("finished", [])
@@ -380,7 +422,13 @@ NEXT_HINTS = {
     "step_budget": "Session step budget reached. Read what you have, then finish.",
     "stale_page": "The page kept navigating. Call ultrafast_step again, or retarget.",
     "error": "The run hit an error; see `error`. The tab is still open — retarget or finish.",
+    "needs_confirmation": "Jev wants to run an action that commits something (submit, order, pay, "
+    "send, sign in, delete). It was NOT executed. Show the user pending_decision and gate_reason, "
+    "and only re-run with approved set to that exact target_label if they say yes.",
+    "blocked_action": "Jev wants to type into a field that asks for a secret (password, card, ID). "
+    "This is never executed. Tell the user to fill it themselves, then continue.",
     "retargeted": "New sub-goal set on the same tab. Call ultrafast_step to run it.",
+    "navigated": "The tab now points at a different site. Call ultrafast_step to run the goal there.",
     "finished": "Session closed.",
 }
 

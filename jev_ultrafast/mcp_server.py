@@ -137,6 +137,27 @@ def ultrafast_retarget(session_id: str, goal: str) -> str:
 
 
 @mcp.tool()
+def ultrafast_navigate(session_id: str, url: str, goal: str = "") -> str:
+    """Point the same tab at a different site, keeping the browser session and any login.
+
+    Use this when the site itself cannot do the job — retargeting only restates the goal for the
+    page you are already on, so a wrong site cannot be fixed by a better sub-goal.
+
+    Args:
+        session_id: From ultrafast_start.
+        url: The http(s) URL to open in the same tab.
+        goal: Optional new sub-goal to run there.
+
+    Returns:
+        JSON with the observation on the new site.
+    """
+    try:
+        return _dump({"ok": True, **sessions.get(session_id).navigate(url, goal or None)})
+    except Exception as exc:
+        return _fail(exc)
+
+
+@mcp.tool()
 def ultrafast_finish(session_id: str) -> str:
     """Close the session and its tab, and return a final summary.
 
