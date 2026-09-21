@@ -20,17 +20,59 @@ class StalePage(ValueError):
 class Browser:
     def __init__(self, url):
         ensure_daemon()
+        self.opened = []
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        self.equip()
+        self.call("Page.navigate", url=url)
+        self.settle()
+
+    def equip(self):
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        self.call("Page.navigate", url=url)
+
+    def settle(self):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if self.evaluate("document.readyState") == "complete":
-                break
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    return
+            except StalePage:
+                pass
             time.sleep(0.02)
+
+    def adopt_popup(self, timeout=0.0):
+        """Follow a tab this page opened, so target="_blank" is not mistaken for a dead click.
+
+        One agent owns one tab. A link that opens a new tab leaves the observed page untouched,
+        which is indistinguishable from a click that did nothing, and a correct choice then looks
+        like a stall. Only the caller that saw no change pays for this lookup.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            for info in cdp("Target.getTargets")["targetInfos"]:
+                if info.get("type") == "page" and info.get("openerId") == self.target:
+                    self.opened.append(self.target)
+                    self.target = info["targetId"]
+                    self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+                    self.after_input = None
+                    self.equip()
+                    # A fresh popup is "complete" while still on about:blank; settling there would
+                    # hand the model an empty page and call it progress.
+                    blank = time.monotonic() + 3.0
+                    while time.monotonic() < blank:
+                        try:
+                            if self.evaluate("location.href") not in (None, "about:blank"):
+                                break
+                        except StalePage:
+                            pass
+                        time.sleep(0.05)
+                    self.settle()
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
@@ -107,9 +149,13 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        for target in [*self.opened, self.target]:
+            if target:
+                try:
+                    cdp("Target.closeTarget", targetId=target)
+                except Exception:
+                    pass
+        self.opened, self.target = [], None
 
 
 def fingerprint(state):

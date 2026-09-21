@@ -149,6 +149,10 @@ class Agent:
                 }
             )
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            if action["kind"] == "click" and state["page"]["fingerprint"] == page["fingerprint"]:
+                # A click that opened a new tab reads exactly like a click that did nothing.
+                if state["browser"].adopt_popup(timeout=0.6):
+                    state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],

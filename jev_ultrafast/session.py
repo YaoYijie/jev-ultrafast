@@ -28,6 +28,9 @@ ARTIFACTS = ROOT / "artifacts" / "sessions"
 # while the ones worth stopping sit near 0.2. A floor above ~0.4 interrupts decisions that are right.
 MIN_CONFIDENCE = 0.35
 STALL_LIMIT = 2
+# A click that reopens the same document in a new tab changes the fingerprint every time, so
+# page_changed cannot see that nothing is advancing. Repeating one choice is the other stall.
+REPEAT_LIMIT = 3
 STEP_BUDGET = 40
 STALE_RETRIES = 3
 
@@ -117,6 +120,18 @@ class Session:
         count = 0
         for entry in reversed(self.agent.state["history"]):
             if entry.get("kind") == "wait" or entry.get("page_changed") is not False:
+                break
+            count += 1
+        return count
+
+    def _trailing_repeat(self) -> int:
+        history = [h for h in self.agent.state["history"] if h.get("kind") != "wait"]
+        if not history:
+            return 0
+        label = history[-1].get("action")
+        count = 0
+        for entry in reversed(history):
+            if entry.get("action") != label:
                 break
             count += 1
         return count
@@ -239,6 +254,9 @@ class Session:
                 if self._trailing_stall() >= stall_limit:
                     stop = "stalled"
                     break
+                if self._trailing_repeat() >= REPEAT_LIMIT:
+                    stop = "looping"
+                    break
 
             return self._report(stop or "steps_exhausted", executed)
 
@@ -340,6 +358,9 @@ NEXT_HINTS = {
     "ultrafast_retarget with a narrower sub-goal, or ultrafast_finish.",
     "stalled": "The page stopped changing. Retarget with a narrower sub-goal, or finish and start "
     "a new session from a more specific URL.",
+    "looping": "Jev chose the same element several times in a row without advancing — often a link "
+    "that reopens the same document in a new tab. Retarget with a sub-goal that names a "
+    "different next outcome, or read what is on the page and finish.",
     "done": "Jev reports the goal is visibly satisfied. Verify with ultrafast_read, then "
     "ultrafast_finish.",
     "blocked": "Jev found no supported operation. Retarget with a narrower sub-goal, or finish.",
