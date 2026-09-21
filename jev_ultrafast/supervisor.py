@@ -8,7 +8,7 @@ coordinate or an element to click: those choices stay with Jev, on the elements 
 import json
 import os
 
-from .model import post_json
+from .model import extra_headers, post_json
 
 PLAN = """You plan browsing tasks for an agent that chooses its own clicks.
 
@@ -109,7 +109,8 @@ def _chat(system: str, payload, as_json: bool = True, max_tokens: int = 2048) ->
     }
     if as_json:
         body["response_format"] = {"type": "json_object"}
-    result = post_json(base + "/chat/completions", key, body)
+    result = post_json(base + "/chat/completions", key, body,
+                       headers=extra_headers("SUPERVISOR", "TEXT_MODEL"))
     return result["choices"][0]["message"]["content"]
 
 

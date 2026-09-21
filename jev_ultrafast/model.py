@@ -12,10 +12,32 @@ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
-def post_json(url, key, body):
+def extra_headers(*prefixes):
+    """Provider headers some gateways require, as a JSON object in <PREFIX>_HEADERS.
+
+    An OpenAI-compatible URL is not always enough: a gateway may reject a request that carries no
+    routing header of its own. The first prefix that is set wins, so a supervisor can override the
+    text helper's.
+    """
+    for prefix in prefixes:
+        raw = os.environ.get(f"{prefix}_HEADERS")
+        if not raw:
+            continue
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            raise ValueError(f"{prefix}_HEADERS must be a JSON object") from None
+        if not isinstance(value, dict):
+            raise ValueError(f"{prefix}_HEADERS must be a JSON object")
+        return {str(k): str(v) for k, v in value.items()}
+    return {}
+
+
+def post_json(url, key, body, headers=None):
+    sent = {"Authorization": f"Bearer {key}", **(headers or {})}
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body, headers=sent)
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -183,6 +205,7 @@ def field_text(context):
                 },
             ],
         },
+        headers=extra_headers("TEXT_MODEL"),
     )
     try:
         output = json.loads(result["choices"][0]["message"]["content"])
