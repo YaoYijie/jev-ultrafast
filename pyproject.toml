@@ -14,6 +14,7 @@ dependencies = [
 [project.scripts]
 jev = "jev_ultrafast.demo:main"
 jev-auto = "jev_ultrafast.autopilot:main"
+jev-auto-ui = "jev_ultrafast.webui:main"
 
 [build-system]
 requires = ["hatchling"]

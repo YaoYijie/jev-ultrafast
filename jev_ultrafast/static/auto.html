@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Jev Auto</title>
+<style>
+:root{font-family:InterVariable,Inter,system-ui,sans-serif;color:#252523;background:#fafaf7;
+  font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased;
+  --line:rgb(0 0 0 / .09);--green:#176743;--orange:#ed6738;--dim:#6b6b66}
+*{box-sizing:border-box}body{margin:0}
+header{height:64px;padding:0 24px;display:flex;align-items:center;gap:12px;
+  border-bottom:1px solid var(--line);background:#fff}
+header b{font-size:15px}header span{color:var(--dim);font-size:13px}
+main{max-width:940px;margin:0 auto;padding:24px}
+.card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+label{display:block;font-size:12px;color:var(--dim);margin:0 0 4px}
+textarea,input[type=text],input[type=number]{width:100%;font:inherit;font-size:14px;padding:8px 10px;
+  border:1px solid var(--line);border-radius:6px;background:#fff;color:inherit}
+textarea{min-height:64px;resize:vertical}
+.row{display:flex;gap:12px;margin-top:12px;flex-wrap:wrap}.row>div{flex:1;min-width:130px}
+.opts{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--dim)}
+button{font:inherit;font-size:14px;padding:9px 18px;border-radius:6px;border:1px solid transparent;
+  background:var(--green);color:#fff;cursor:pointer}
+button[disabled]{opacity:.45;cursor:default}
+button.ghost{background:#fff;color:#252523;border-color:var(--line)}
+button.warn{background:var(--orange)}
+#log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.65;
+  white-space:pre-wrap;word-break:break-word;max-height:46vh;overflow:auto;margin:0}
+#ask{border-color:var(--orange);background:#fff8f5}
+#ask p{margin:0 0 12px;font-size:14px;white-space:pre-wrap}
+.pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--dim)}
+h2{font-size:15px;margin:0 0 12px}
+#out table{border-collapse:collapse;width:100%;font-size:13px;margin:10px 0}
+#out th,#out td{border:1px solid var(--line);padding:6px 9px;text-align:left}
+#out th{background:#f4f4f0}
+#out h1,#out h2,#out h3{font-size:15px;margin:16px 0 8px}
+#out{font-size:14px;line-height:1.7}
+#out code{background:#f4f4f0;padding:1px 4px;border-radius:3px;font-size:12.5px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<header><b>Jev Auto</b><span>JEV 决定每一次点击 · 提交类动作会先问你</span></header>
+<main>
+  <div class="card">
+    <label for="need">需求</label>
+    <textarea id="need" placeholder="例如：帮我查 2026 年 10 月 21 日上海飞东京的机票，列出航司、起降时间、时长和价格，排掉红眼航班"></textarea>
+    <div class="row">
+      <div style="flex:3"><label for="url">起始网址（留空则由规划器决定）</label>
+        <input id="url" type="text" placeholder="https://www.google.com/travel/flights?hl=en"></div>
+      <div><label for="chunk">每段步数</label><input id="chunk" type="number" value="6" min="1" max="12"></div>
+      <div><label for="max">总步数上限</label><input id="max" type="number" value="30" min="4" max="80"></div>
+    </div>
+    <div class="opts">
+      <input id="commit" type="checkbox">
+      <label for="commit" style="margin:0">允许提交类动作（仍会逐个弹出确认；不勾选＝只读运行，遇到就直接拒绝）</label>
+    </div>
+    <div class="row"><div style="flex:0 0 auto">
+      <button id="go">开始</button>
+      <span id="status" class="pill" style="margin-left:8px">空闲</span>
+    </div></div>
+  </div>
+
+  <div class="card hidden" id="ask">
+    <h2>⏸ 需要你确认</h2>
+    <p id="askText"></p>
+    <button id="yes" class="warn">执行这个动作</button>
+    <button id="no" class="ghost">拒绝</button>
+  </div>
+
+  <div class="card hidden" id="logCard"><h2>执行过程</h2><pre id="log"></pre></div>
+  <div class="card hidden" id="outCard"><h2>结果</h2><div id="out"></div></div>
+</main>
+<script>
+const TOKEN = "__TOKEN__";
+const $ = id => document.getElementById(id);
+let busy = false;
+
+async function post(path, body) {
+  const r = await fetch(path, {method:"POST",
+    headers:{"Content-Type":"application/json","X-Jev-Token":TOKEN},
+    body: JSON.stringify(body)});
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || r.status);
+  return d;
+}
+
+$("go").onclick = async () => {
+  const need = $("need").value.trim();
+  if (!need) return;
+  try {
+    await post("/api/start", {need, url:$("url").value.trim(),
+      chunk:+$("chunk").value, max_steps:+$("max").value, allow_commit:$("commit").checked});
+    $("logCard").classList.remove("hidden");
+    $("outCard").classList.add("hidden");
+    $("out").innerHTML = "";
+  } catch (e) { alert(e.message); }
+};
+$("yes").onclick = () => post("/api/answer", {approve:true}).catch(e => alert(e.message));
+$("no").onclick  = () => post("/api/answer", {approve:false}).catch(e => alert(e.message));
+
+// Minimal renderer: the answer is Markdown, and it is mostly tables.
+function render(md) {
+  const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  const inline = s => esc(s).replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")
+                            .replace(/`(.+?)`/g,"<code>$1</code>")
+                            .replace(/\[(.+?)\]\((https?:[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  const out = []; const lines = md.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^\|/.test(l) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i+1] || "")) {
+      const cells = r => r.split("|").slice(1,-1).map(c => c.trim());
+      let html = "<table><thead><tr>" + cells(l).map(c => `<th>${inline(c)}</th>`).join("") + "</tr></thead><tbody>";
+      i += 2;
+      while (i < lines.length && /^\|/.test(lines[i])) {
+        html += "<tr>" + cells(lines[i]).map(c => `<td>${inline(c)}</td>`).join("") + "</tr>"; i++;
+      }
+      i--; out.push(html + "</tbody></table>"); continue;
+    }
+    const h = l.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); continue; }
+    if (/^\s*[-*]\s+/.test(l)) { out.push(`<div style="margin-left:1em">• ${inline(l.replace(/^\s*[-*]\s+/,""))}</div>`); continue; }
+    out.push(l.trim() ? `<p style="margin:6px 0">${inline(l)}</p>` : "");
+  }
+  return out.join("");
+}
+
+async function poll() {
+  try {
+    const s = await (await fetch("/api/state")).json();
+    $("status").textContent = {idle:"空闲",running:"运行中",done:"完成",error:"出错"}[s.status] || s.status;
+    busy = s.status === "running";
+    $("go").disabled = busy;
+    const log = $("log");
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+    const text = s.lines.join("\n");
+    if (log.textContent !== text) { log.textContent = text; if (atBottom) log.scrollTop = log.scrollHeight; }
+    if (s.question) { $("askText").textContent = s.question; $("ask").classList.remove("hidden"); }
+    else $("ask").classList.add("hidden");
+    if (s.error) { $("out").innerHTML = `<p style="color:var(--orange)">${s.error}</p>`; $("outCard").classList.remove("hidden"); }
+    else if (s.result && s.result.answer) {
+      $("out").innerHTML = render(s.result.answer) +
+        `<p class="pill" style="margin-top:14px">共 ${s.result.total_steps} 步 · ${s.result.elapsed_s}s · 访问 ${s.result.visited.length} 个页面</p>`;
+      $("outCard").classList.remove("hidden");
+    }
+  } catch (e) { /* server not up yet */ }
+  setTimeout(poll, busy ? 700 : 1500);
+}
+poll();
+</script>
+</body>
+</html>

@@ -113,7 +113,13 @@ def _chat(system: str, payload, as_json: bool = True, max_tokens: int = 2048) ->
     result = post_json(base + "/chat/completions", key, body,
                        headers=extra_headers("SUPERVISOR", "TEXT_MODEL"),
                        timeout=float(os.environ.get("SUPERVISOR_TIMEOUT", "90")))
-    return result["choices"][0]["message"]["content"]
+    content = (result["choices"][0]["message"].get("content") or "").strip()
+    if not content:
+        # A reasoning model can spend the whole budget thinking and answer with nothing. That is
+        # not an exception, so without this an empty report would be reported as success.
+        raise ValueError(f"{model_name()} returned empty content (finish_reason="
+                         f"{result['choices'][0].get('finish_reason')!r})")
+    return content
 
 
 def _loads(raw: str) -> dict:
@@ -188,5 +194,12 @@ def judge(need: str, leg_goal: str, report: dict, remaining: int,
     }
 
 
-def write_report(need: str, collected: list[dict]) -> str:
-    return _chat(REPORT, {"need": need, "visited": collected}, as_json=False, max_tokens=3000)
+def write_report(need: str, collected: list[dict], attempts: int = 2) -> str:
+    budget = int(os.environ.get("SUPERVISOR_REPORT_TOKENS", "6000"))
+    last = None
+    for _ in range(attempts):
+        try:
+            return _chat(REPORT, {"need": need, "visited": collected}, as_json=False, max_tokens=budget)
+        except ValueError as exc:
+            last = exc
+    raise last

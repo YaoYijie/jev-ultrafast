@@ -49,7 +49,7 @@ def _collect(store: dict, session) -> None:
         store[url] = {"url": url, "title": page.get("title"), "text": text[:4000]}
 
 
-def _show(report: dict) -> None:
+def _show(report: dict, say=_say) -> None:
     for entry in report.get("steps_executed", []):
         if "step" in entry:
             changed = "→" if entry["page_changed"] else "·"
@@ -61,25 +61,29 @@ def _show(report: dict) -> None:
 
 
 def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
-        allow_commit: bool = True) -> dict:
+        allow_commit: bool = True, say=None, ask=None) -> dict:
+    # The CLI talks to a terminal and the web UI talks to a browser; the loop itself should not
+    # care which, and must never reach for stdin on its own.
+    say = say or _say
+    ask = ask or _ask
     started = time.time()
     sessions.load_env()
-    _say(f"需求: {need}")
-    _say(f"监督模型: {supervisor.model_name()}    填值模型: {os.environ.get('TEXT_MODEL', '?')}")
-    _say("规划中…")
+    say(f"需求: {need}")
+    say(f"监督模型: {supervisor.model_name()}    填值模型: {os.environ.get('TEXT_MODEL', '?')}")
+    say("规划中…")
     try:
         plan = supervisor.plan(need, url)
     except Exception as exc:
         if not url:
             raise
-        _say(f"   ⚠ 规划失败（{type(exc).__name__}），退回单段模式。")
+        say(f"   ⚠ 规划失败（{type(exc).__name__}），退回单段模式。")
         plan = {"start_url": url, "legs": [{"goal": need}]}
     legs = plan["legs"]
     for i, leg in enumerate(legs, 1):
-        _say(f"   {i}. {leg['goal']}")
+        say(f"   {i}. {leg['goal']}")
 
     session = sessions.start(plan["start_url"], legs[0]["goal"])
-    _say(f"\n会话 {session.id} @ {plan['start_url']}")
+    say(f"\n会话 {session.id} @ {plan['start_url']}")
     collected: dict = {}
     trace: list = []
     tried: set = {plan["start_url"]}
@@ -89,39 +93,39 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
 
     try:
         while index < len(legs) and session.total_steps < max_steps:
-            _say(f"\n── leg {index + 1}/{len(legs)}: {legs[index]['goal']}")
+            say(f"\n── leg {index + 1}/{len(legs)}: {legs[index]['goal']}")
             idle = 0
             hops = NAVIGATIONS_PER_LEG
             for _ in range(CHECKPOINTS_PER_LEG):
                 before = session.total_steps
                 report = session.step(steps=chunk, gated=True, approved=approved)
                 approved = None
-                _show(report)
+                _show(report, say)
                 _collect(collected, session)
                 trace.append({"leg": index + 1, "stop_reason": report["stop_reason"],
                               "steps": report["steps_executed"]})
                 stop = report["stop_reason"]
                 pending = report.get("pending_decision") or {}
-                _say(f"   ⟂ {stop}")
+                say(f"   ⟂ {stop}")
 
                 if stop == "blocked_action":
-                    _say(f"   ⛔ {pending.get('gate_reason', '')}")
-                    _say("      这类字段不代填。请在 Chrome 里自己填好。")
-                    if not _ask("      填好了，继续这一段？"):
+                    say(f"   ⛔ {pending.get('gate_reason', '')}")
+                    say("      这类字段不代填。请在 Chrome 里自己填好。")
+                    if not ask("      填好了，继续这一段？"):
                         break
                     continue
 
                 if stop == "needs_confirmation":
-                    _say(f"   ⏸  {pending.get('gate_reason', '')}")
-                    _say(f"      动作: {pending.get('operation')} → {pending.get('target_label')}")
-                    _say(f"      页面: {report['observation']['url']}")
+                    say(f"   ⏸  {pending.get('gate_reason', '')}")
+                    say(f"      动作: {pending.get('operation')} → {pending.get('target_label')}")
+                    say(f"      页面: {report['observation']['url']}")
                     if not allow_commit:
-                        _say("      --no-commit 模式，已拒绝。")
+                        say("      --no-commit 模式，已拒绝。")
                         break
-                    if _ask("      执行这个动作？"):
+                    if ask("      执行这个动作？"):
                         approved = pending.get("target_label")
                         continue
-                    _say("      已拒绝，转交监督者处理。")
+                    say("      已拒绝，转交监督者处理。")
 
                 idle = idle + 1 if session.total_steps == before else 0
                 try:
@@ -129,11 +133,11 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                                                tried=sorted(tried), navigations_left=hops)
                 except Exception as exc:
                     # Losing the supervisor must not throw away a browsing run that is going fine.
-                    _say(f"   ⚠ 监督模型调用失败（{type(exc).__name__}），本段到此为止。")
+                    say(f"   ⚠ 监督模型调用失败（{type(exc).__name__}），本段到此为止。")
                     break
-                _say(f"   ⟳ {verdict['action']}  {verdict['note']}")
+                say(f"   ⟳ {verdict['action']}  {verdict['note']}")
                 if idle >= IDLE_CHECKPOINTS and verdict["action"] not in {"navigate", "finish"}:
-                    _say(f"   ✗ 连续 {idle} 个检查点没有执行任何动作，放弃这一段。")
+                    say(f"   ✗ 连续 {idle} 个检查点没有执行任何动作，放弃这一段。")
                     break
                 if verdict["action"] == "continue":
                     continue
@@ -141,22 +145,22 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                     # More of the same goal cannot help here. The detectors already proved it for
                     # looping and stalled, and after done or blocked the session refuses to step
                     # at all until the goal is replaced, so "continue" executes literally nothing.
-                    _say(f"   ⚠ {stop} 之后 continue 不会执行任何动作，改为换目标。")
+                    say(f"   ⚠ {stop} 之后 continue 不会执行任何动作，改为换目标。")
                     verdict["action"] = "retarget" if verdict["goal"] else "next"
                 if verdict["action"] == "force" and not pending:
                     # force only releases a held-back low-confidence choice. A weak supervisor
                     # reaches for it to mean "type something else", which it cannot do.
-                    _say("   ⚠ 没有被扣住的决策，force 无效，改为换目标。")
+                    say("   ⚠ 没有被扣住的决策，force 无效，改为换目标。")
                     verdict["action"] = "retarget" if verdict["goal"] else "next"
                 if verdict["action"] == "force":
                     approved = pending.get("target_label")
                     report = session.step(steps=1, force=True, gated=True, approved=approved)
                     approved = None
-                    _show(report)
+                    _show(report, say)
                     _collect(collected, session)
                     continue
                 if verdict["action"] == "navigate" and verdict["url"] and hops > 0:
-                    _say(f"   ↪ 换站点: {verdict['url']}")
+                    say(f"   ↪ 换站点: {verdict['url']}")
                     tried.add(verdict["url"])
                     hops -= 1
                     session.navigate(verdict["url"], verdict["goal"] or None)
@@ -170,7 +174,7 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                 finished = verdict["action"] == "finish"
                 break
             else:
-                _say("   本段检查点用尽，进入下一段。")
+                say("   本段检查点用尽，进入下一段。")
 
             if finished:
                 break
@@ -178,7 +182,7 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
             if index < len(legs):
                 session.retarget(legs[index]["goal"])
 
-        _say(f"\n共 {session.total_steps} 步，访问 {len(collected)} 个页面，汇总中…")
+        say(f"\n共 {session.total_steps} 步，访问 {len(collected)} 个页面，汇总中…")
         try:
             answer = supervisor.write_report(need, list(collected.values()))
         except Exception as exc:
