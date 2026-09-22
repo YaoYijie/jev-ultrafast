@@ -91,6 +91,22 @@ uv run --env-file .env python examples/run.py \
 
 `uv run --env-file .env python examples/flights.py --keep-open` performs the flight search, checks the actual route/date/results, and saves its trace. It does not select or book a flight.
 
+### Read-only recruiting-platform patrols
+
+`jev-auto` has a dedicated foreground mode for an explicitly requested recruiting-platform check:
+
+```bash
+uv run jev-auto "Search the requested city and read a small set of job results" \
+  --job-patrol --url https://www.zhipin.com/web/geek/job --json /tmp/job-patrol.json
+```
+
+This mode uses the user's visible Chrome profile, stays on the platform named by `--url`, caps a
+run at 20 actions with two actions per checkpoint, and waits between actions. It blocks applying,
+messaging, saving, following, login and verification actions. A CAPTCHA, abnormal-account/IP
+message, login wall, 401/403/429 page, or navigation to another site ends the run. Run only one
+platform at a time. Scheduled or unattended market monitoring should use public search indexes and
+company career sites instead.
+
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.

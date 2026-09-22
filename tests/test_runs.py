@@ -18,12 +18,12 @@ from jev_ultrafast import runs
 def fake_loop(result=None, hold=None):
     """Stand in for autopilot.run: no browser, no models, no network."""
     def inner(need, url=None, chunk=6, max_steps=40, allow_commit=True,
-              say=None, ask=None, should_stop=None):
+              say=None, ask=None, should_stop=None, mode="standard"):
         if hold is not None:
             hold(say, ask, should_stop)
         return {"need": need, "start_url": url or "about:blank", "legs": [], "total_steps": 3,
                 "elapsed_s": 0.1, "visited": [{"url": "https://e.test", "title": "T", "text": "body"}],
-                "trace": [], "declined": [], "answer": "answer", **(result or {})}
+                "trace": [], "declined": [], "answer": "answer", "mode": mode, **(result or {})}
     return inner
 
 
@@ -71,6 +71,11 @@ class UnwatchedRunsCannotApprove(Isolated):
         with mock.patch.object(runs.autopilot, "run", record):
             self.finished(watched=False, allow_commit=True)
         self.assertIs(seen["allow_commit"], False)
+
+    def test_job_patrol_mode_reaches_the_loop(self):
+        with mock.patch.object(runs.autopilot, "run", fake_loop()):
+            run = self.finished(mode="job_patrol", url="https://www.zhipin.com/web/geek/job")
+        self.assertEqual(run.result["mode"], "job_patrol")
 
 
 class WatchedRunsWaitForAPerson(Isolated):
@@ -192,6 +197,11 @@ class PollingAndHistory(Isolated):
     def test_an_empty_need_is_refused_before_a_browser_opens(self):
         with self.assertRaises(ValueError):
             runs.start("   ")
+
+    def test_job_patrol_requires_a_supported_explicit_url(self):
+        for url in [None, "https://example.com/jobs"]:
+            with self.assertRaises(ValueError):
+                runs.start("巡检", url=url, mode="job_patrol")
 
 
 class Persistence(Isolated):

@@ -5,8 +5,8 @@ import unittest
 from jev_ultrafast import guard
 
 
-def verdict(kind, label):
-    return guard.gate({}, {"kind": kind, "label": label}, {})[0]
+def verdict(kind, label, mode="standard"):
+    return guard.gate({}, {"kind": kind, "label": label}, {}, mode=mode)[0]
 
 
 class GateAllowsReadingAndMoving(unittest.TestCase):
@@ -60,6 +60,20 @@ class GateNeverTypesSecrets(unittest.TestCase):
 
     def test_blocking_is_not_merely_a_confirmation(self):
         self.assertNotEqual(verdict("fill", "密码"), guard.CONFIRM)
+
+
+class JobPatrolIsStrictlyReadOnly(unittest.TestCase):
+    def test_recruiting_state_changes_are_blocked(self):
+        for label in ["立即沟通", "打招呼", "聊一聊", "收藏职位", "关注招聘者", "保存", "完成验证"]:
+            self.assertEqual(verdict("click", label, mode="job_patrol"), guard.BLOCK, label)
+
+    def test_account_fields_are_blocked(self):
+        for label in ["手机号", "用户名", "Email"]:
+            self.assertEqual(verdict("fill", label, mode="job_patrol"), guard.BLOCK, label)
+
+    def test_search_controls_stay_available(self):
+        for kind, label in [("fill", "搜索关键词"), ("select", "城市"), ("click", "搜索职位")]:
+            self.assertEqual(verdict(kind, label, mode="job_patrol"), guard.ALLOW, label)
 
 
 if __name__ == "__main__":

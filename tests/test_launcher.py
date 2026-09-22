@@ -111,7 +111,50 @@ class Describing(PortFile):
         with mock.patch.object(launcher, "_version", answers({"http://127.0.0.1:9222": GUID})):
             got = launcher.describe()
         self.assertTrue(got["is_user_profile"])
+        self.assertTrue(got["profile_has_logins"])
+        self.assertEqual(got["profile_dir"], str(launcher.default_user_data_dir()))
         self.assertIn("登录态可用", got["note"])
+
+
+class BrowserHarnessUserProfile(unittest.TestCase):
+    def test_named_local_daemon_is_reported_as_the_user_browser(self):
+        seen = {}
+
+        def ensure_local(**_kwargs):
+            import os
+            seen["during"] = os.environ.get("BU_CDP_URL")
+
+        with mock.patch.dict("os.environ", {"BU_CDP_URL": "http://isolated.test:9222"}), \
+                mock.patch.object(launcher, "ensure_harness_daemon", side_effect=ensure_local) as ensure, \
+                mock.patch.object(launcher, "daemon_browser_kind", return_value="local"), \
+                mock.patch.object(launcher, "daemon_browser_ready", return_value=True):
+            got = launcher.ensure_user_browser("patrol", {"BU_CDP_URL": ""})
+            import os
+            self.assertEqual(os.environ["BU_CDP_URL"], "http://isolated.test:9222")
+        ensure.assert_called_once_with(wait=20, name="patrol", env={"BU_CDP_URL": ""})
+        self.assertIsNone(seen["during"])
+        self.assertTrue(got["is_user_profile"])
+        self.assertEqual(got["browser_kind"], "local")
+
+    def test_remote_or_unhealthy_daemon_is_refused(self):
+        for kind, ready in [("cloud", True), ("cdp", True), ("local", False)]:
+            with self.subTest(kind=kind, ready=ready), \
+                    mock.patch.object(launcher, "ensure_harness_daemon"), \
+                    mock.patch.object(launcher, "daemon_browser_kind", return_value=kind), \
+                    mock.patch.object(launcher, "daemon_browser_ready", return_value=ready), \
+                    self.assertRaises(RuntimeError):
+                launcher.ensure_user_browser("patrol", {}, ready_timeout_s=0)
+
+    def test_a_local_daemon_gets_a_brief_readiness_retry_between_patrols(self):
+        with mock.patch.object(launcher, "ensure_harness_daemon"), \
+                mock.patch.object(launcher, "daemon_browser_kind", return_value="local"), \
+                mock.patch.object(
+                    launcher, "daemon_browser_ready", side_effect=[False, True]
+                ) as ready:
+            got = launcher.ensure_user_browser("patrol", {})
+        self.assertEqual(ready.call_count, 2)
+        self.assertTrue(got["is_user_profile"])
+        self.assertEqual(got["browser_kind"], "local")
 
 
 class EnsuringChrome(PortFile):

@@ -6,10 +6,11 @@ model summarises the page on the way back.
 """
 
 import json
+from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
 
-from . import launcher, runs
+from . import job_patrol, launcher, runs
 from . import session as sessions
 from .launcher import is_chrome_cdp_ready
 from .session import MIN_CONFIDENCE, STALL_LIMIT
@@ -197,7 +198,7 @@ def ultrafast_status() -> str:
 
 
 @mcp.tool()
-def auto_start(need: str, url: str = "") -> str:
+def auto_start(need: str, url: str = "", mode: Literal["standard", "job_patrol"] = "standard") -> str:
     """Start a background browsing task from a plain-language need and return its id immediately.
 
     A supervisor model plans the legs, Jev chooses every click, and a report is written at the end.
@@ -215,18 +216,33 @@ def auto_start(need: str, url: str = "") -> str:
         need: What the user wants to know or reach, in their own words. State the whole need —
             the planner splits it into legs. 'Find direct flights Shanghai to Tokyo next Friday
             with prices' works. 'Click the search button' wastes the whole machine.
-        url: Optional starting URL. Leave empty to let the planner choose the site.
+        url: Optional starting URL. Leave empty to let the planner choose the site. Required when
+            mode is job_patrol and must point directly at one supported recruiting platform.
+        mode: Use standard for ordinary browsing. Use job_patrol only for an explicit foreground
+            recruiting-platform request; it fixes one platform, uses the user's visible Chrome,
+            throttles actions, blocks recruiting writes, and stops on risk-control signals.
 
     Returns:
         JSON with run_id and what to call next.
     """
     try:
-        run = runs.start(need, url=url or None, watched=False, allow_commit=False)
-        browser = launcher.describe()
+        if mode == job_patrol.MODE:
+            if not url:
+                raise ValueError("job_patrol 必须提供一个明确的招聘平台起始 URL")
+            job_patrol.require_platform_url(url)
+            if runs.live() or sessions.live():
+                raise ValueError("岗位巡检必须独占本地浏览器；请先结束当前 Jev 任务或会话")
+            browser = sessions.prepare(mode)
+        elif mode == "standard":
+            browser = launcher.describe()
+        else:
+            raise ValueError(f"Unknown auto_start mode: {mode}")
+        run = runs.start(need, url=url or None, watched=False, allow_commit=False, mode=mode)
         return _dump({
             "ok": True,
             "run_id": run.id,
             "status": run.status,
+            "mode": mode,
             "commits_allowed": False,
             # Without the user's own profile the run is logged into nothing, and a site that
             # needs an account will look broken rather than logged out.

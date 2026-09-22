@@ -14,7 +14,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import guard
+from . import guard, job_patrol, launcher
 from .agent import Agent
 from .browser import StalePage
 from .launcher import ensure_chrome_running
@@ -82,15 +82,40 @@ def _decision_view(decision: dict, page: dict) -> dict:
 
 
 class Session:
-    def __init__(self, url: str, goal: str, screenshots: bool = True):
+    def __init__(
+        self,
+        url: str,
+        goal: str,
+        screenshots: bool = True,
+        mode: str = "standard",
+        allowed_platform: str | None = None,
+        action_delay_s: float = 0,
+        step_budget: int = STEP_BUDGET,
+    ):
+        if mode not in {"standard", job_patrol.MODE}:
+            raise ValueError(f"Unknown session mode: {mode}")
+        if mode == job_patrol.MODE:
+            allowed_platform = job_patrol.require_platform_url(url, allowed_platform)
         self.id = uuid.uuid4().hex[:12]
         self.dir = ARTIFACTS / self.id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        self.agent = Agent(url, goal, screenshots=screenshots)
+        browser_options = None
+        if mode == job_patrol.MODE:
+            browser_options = {
+                "daemon_name": job_patrol.DAEMON_NAME,
+                "daemon_env": job_patrol.DAEMON_ENV,
+            }
+        self.agent = Agent(url, goal, screenshots=screenshots, browser_options=browser_options)
         self.created_at = time.time()
         self.touched_at = time.time()
         self.total_steps = 0
+        self.mode = mode
+        self.allowed_platform = allowed_platform
+        self.action_delay_s = max(0.0, float(action_delay_s))
+        self.step_budget = max(1, int(step_budget))
+        self.last_action_at: float | None = None
+        self.blocked_reason: str | None = None
         self.shot_index = 0
         self.legs = [{"goal": goal, "started_at_step": 0}]
         self.archive: list[dict] = []
@@ -146,6 +171,24 @@ class Session:
             count += 1
         return count
 
+    def _patrol_stop(self) -> str | None:
+        if self.mode != job_patrol.MODE:
+            return None
+        if self.blocked_reason:
+            return "platform_blocked"
+        stopped = job_patrol.page_stop(self.agent.state["page"], self.allowed_platform)
+        if stopped:
+            stop, self.blocked_reason = stopped
+            return stop
+        return None
+
+    def _pace(self) -> None:
+        if self.mode != job_patrol.MODE or self.last_action_at is None:
+            return
+        remaining = self.action_delay_s - (time.monotonic() - self.last_action_at)
+        if remaining > 0:
+            time.sleep(remaining)
+
     # -- public surface ------------------------------------------------------
 
     def observation(self, text_chars: int = 4000, elements: int = 30, screenshot: bool = True) -> dict:
@@ -191,12 +234,18 @@ class Session:
             stop = None
 
             while len(executed) < max(1, steps):
+                patrol_stop = self._patrol_stop()
+                if patrol_stop:
+                    stop = patrol_stop
+                    break
                 if agent.state["status"] in {"done", "blocked"}:
                     stop = agent.state["status"]
                     break
-                if self.total_steps >= STEP_BUDGET:
+                if self.total_steps >= self.step_budget:
                     stop = "step_budget"
                     break
+
+                self._pace()
 
                 try:
                     agent.command("predict", {})
@@ -232,7 +281,7 @@ class Session:
                 chosen = next((a for a in page["actions"] if a["id"] == decision["choice"]), None)
                 soft = chosen is not None and chosen.get("kind") in SOFT_KINDS
                 if gated:
-                    verdict, reason = guard.gate(decision, chosen, page)
+                    verdict, reason = guard.gate(decision, chosen, page, mode=self.mode)
                     approved_this = approved is not None and chosen is not None and approved == chosen.get("label")
                     if verdict == guard.BLOCK or (verdict == guard.CONFIRM and not approved_this):
                         stop = "blocked_action" if verdict == guard.BLOCK else "needs_confirmation"
@@ -276,6 +325,7 @@ class Session:
 
                 entry = agent.state["history"][-1]
                 self.total_steps += 1
+                self.last_action_at = time.monotonic()
                 executed.append(
                     {
                         "step": self.total_steps,
@@ -290,6 +340,10 @@ class Session:
                         "elapsed_ms": entry.get("elapsed_ms"),
                     }
                 )
+                patrol_stop = self._patrol_stop()
+                if patrol_stop:
+                    stop = patrol_stop
+                    break
                 if self._trailing_stall() >= stall_limit:
                     stop = "stalled"
                     break
@@ -340,6 +394,8 @@ class Session:
             url = url.strip()
             if not url.startswith(("http://", "https://")):
                 raise ValueError("navigate needs an http(s) URL")
+            if self.mode == job_patrol.MODE:
+                job_patrol.require_platform_url(url, self.allowed_platform)
             self.touched_at = time.time()
             browser = self.agent.browser
             state = self.agent.state
@@ -408,7 +464,9 @@ class Session:
             "stop_reason": stop_reason,
             "steps_executed": executed,
             "total_steps": self.total_steps,
-            "step_budget": STEP_BUDGET,
+            "step_budget": self.step_budget,
+            "mode": self.mode,
+            "platform": self.allowed_platform,
             "legs": len(self.legs),
             "observation": self.observation(),
             "next": NEXT_HINTS.get(stop_reason, NEXT_HINTS["steps_exhausted"]),
@@ -420,6 +478,8 @@ class Session:
             report["pending_decision"] = self.pending_decision
         if self.last_error:
             report["error"] = self.last_error
+        if self.blocked_reason:
+            report["blocked_reason"] = self.blocked_reason
         return report
 
 
@@ -446,6 +506,10 @@ NEXT_HINTS = {
     "and only re-run with approved set to that exact target_label if they say yes.",
     "blocked_action": "Jev wants to type into a field that asks for a secret (password, card, ID). "
     "This is never executed. Tell the user to fill it themselves, then continue.",
+    "platform_blocked": "The recruiting platform showed a login, verification, rate-limit, or "
+    "risk-control signal. Stop this platform for the current patrol; do not retry with another route.",
+    "left_platform": "The job patrol left its fixed platform. Stop the run instead of following "
+    "the external page or switching sites.",
     "retargeted": "New sub-goal set on the same tab. Call ultrafast_step to run it.",
     "navigated": "The tab now points at a different site. Call ultrafast_step to run the goal there.",
     "finished": "Session closed.",
@@ -469,12 +533,40 @@ def _reap(now: float | None = None) -> None:
             _REGISTRY.pop(session.id, None)
 
 
-def start(url: str, goal: str, screenshots: bool = True) -> Session:
+def prepare(mode: str = "standard") -> dict:
+    """Prepare Chrome synchronously so a background run can fail before it is dispatched."""
     load_env()
+    if mode not in {"standard", job_patrol.MODE}:
+        raise ValueError(f"Unknown session mode: {mode}")
+    if mode == job_patrol.MODE:
+        return launcher.ensure_user_browser(job_patrol.DAEMON_NAME, job_patrol.DAEMON_ENV)
     ensure_chrome_running()
+    return launcher.describe()
+
+
+def start(
+    url: str,
+    goal: str,
+    screenshots: bool = True,
+    mode: str = "standard",
+    allowed_platform: str | None = None,
+    action_delay_s: float = 0,
+    step_budget: int = STEP_BUDGET,
+) -> Session:
+    if mode == job_patrol.MODE:
+        allowed_platform = job_patrol.require_platform_url(url, allowed_platform)
+    prepare(mode)
     with _REGISTRY_LOCK:
         _reap()
-        session = Session(url, goal, screenshots=screenshots)
+        session = Session(
+            url,
+            goal,
+            screenshots=screenshots,
+            mode=mode,
+            allowed_platform=allowed_platform,
+            action_delay_s=action_delay_s,
+            step_budget=step_budget,
+        )
         _REGISTRY[session.id] = session
         return session
 
@@ -503,6 +595,8 @@ def live() -> list[dict]:
                 "goal": s.agent.state["goal"],
                 "status": s.agent.state["status"],
                 "url": s.agent.state["page"].get("url"),
+                "mode": s.mode,
+                "platform": s.allowed_platform,
                 "total_steps": s.total_steps,
                 "idle_s": round(time.time() - s.touched_at),
             }

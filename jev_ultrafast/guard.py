@@ -8,6 +8,8 @@ Upstream already keeps password, file and hidden inputs out of the action space 
 (snapshot.js), so those can never be filled no matter what this returns.
 """
 
+from . import job_patrol
+
 ALLOW = "allow"
 CONFIRM = "confirm"
 BLOCK = "block"
@@ -38,7 +40,7 @@ def _hit(text: str, words) -> str | None:
     return next((w for w in words if w.lower() in lowered), None)
 
 
-def gate(decision: dict, action: dict | None, page: dict) -> tuple[str, str]:
+def gate(decision: dict, action: dict | None, page: dict, mode: str = "standard") -> tuple[str, str]:
     """Return (verdict, reason) for one chosen action, before it is executed."""
     if action is None:
         # DONE / BLOCKED and the scroll and wait controls touch nothing.
@@ -51,7 +53,15 @@ def gate(decision: dict, action: dict | None, page: dict) -> tuple[str, str]:
         secret = _hit(label, SECRET_WORDS)
         if secret:
             return BLOCK, f"字段“{label[:40]}”看起来要求机密信息（匹配“{secret}”），不会代填"
+        if mode == job_patrol.MODE:
+            blocked = job_patrol.blocked_action(kind, label)
+            if blocked:
+                return BLOCK, f"岗位巡检只读模式禁止填写“{label[:60]}”（匹配“{blocked}”）"
         return ALLOW, ""
+    if mode == job_patrol.MODE:
+        blocked = _hit(label, COMMIT_WORDS) or job_patrol.blocked_action(kind, label)
+        if blocked:
+            return BLOCK, f"岗位巡检只读模式禁止执行“{label[:60]}”（匹配“{blocked}”）"
     commit = _hit(label, COMMIT_WORDS)
     if commit:
         return CONFIRM, f"“{label[:60]}”匹配提交类关键词“{commit}”"

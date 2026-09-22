@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import autopilot
+from . import autopilot, job_patrol
 
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / "artifacts" / "runs"
@@ -39,12 +39,13 @@ class Run:
     """One jev-auto task: its log as it happens, and its report once there is one."""
 
     def __init__(self, need: str, url: str | None, chunk: int, max_steps: int,
-                 watched: bool, allow_commit: bool):
+                 watched: bool, allow_commit: bool, mode: str = "standard"):
         self.id = uuid.uuid4().hex[:12]
         self.need = need
         self.url = url or None
         self.chunk = chunk
         self.max_steps = max_steps
+        self.mode = mode
         self.watched = watched
         # Unwatched runs have nobody to ask, and a question nobody answers must never decay into
         # a yes. Refusing to commit is the only honest reading of an empty room.
@@ -117,6 +118,10 @@ class Run:
                 "run_id": self.id,
                 "need": self.need,
                 "status": self.status,
+                "mode": self.mode,
+                "platform": result.get("platform") or (
+                    job_patrol.platform_for_url(self.url) if self.mode == job_patrol.MODE else None
+                ),
                 "watched": self.watched,
                 "allow_commit": self.allow_commit,
                 # Sub-second precision, because history() orders by this and two runs started
@@ -173,6 +178,7 @@ def _worker(run: Run) -> None:
             say=run.say,
             ask=run.ask,
             should_stop=run.should_stop,
+            mode=run.mode,
         )
         with run.lock:
             run.result = result
@@ -192,13 +198,21 @@ def _worker(run: Run) -> None:
 
 
 def start(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
-          watched: bool = False, allow_commit: bool = False) -> Run:
+          watched: bool = False, allow_commit: bool = False, mode: str = "standard") -> Run:
     need = (need or "").strip()
     if not need:
         raise ValueError("需求不能为空")
-    run = Run(need, url, chunk, max_steps, watched, allow_commit)
+    if mode not in {"standard", job_patrol.MODE}:
+        raise ValueError(f"Unknown run mode: {mode}")
+    if mode == job_patrol.MODE:
+        if not url:
+            raise ValueError("job_patrol 必须提供一个明确的招聘平台起始 URL")
+        job_patrol.require_platform_url(url)
+    run = Run(need, url, chunk, max_steps, watched, allow_commit, mode=mode)
     with _REGISTRY_LOCK:
         busy = [r for r in _REGISTRY.values() if r.status in {"running", "waiting"}]
+        if busy and (mode == job_patrol.MODE or any(r.mode == job_patrol.MODE for r in busy)):
+            raise ValueError("岗位巡检必须串行运行；请先等待或取消当前任务：" + "、".join(r.id for r in busy))
         if len(busy) >= MAX_CONCURRENT:
             raise ValueError(
                 f"已有 {len(busy)} 个任务在跑（上限 {MAX_CONCURRENT}）。等它们结束，或先取消一个："

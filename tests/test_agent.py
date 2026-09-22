@@ -239,6 +239,24 @@ def test_observation_is_one_atomic_browser_read(monkeypatch):
     assert cdp.call_args.args[0] == "Runtime.evaluate"
 
 
+def test_named_daemon_cdp_uses_its_own_ipc_socket(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    client = Mock()
+    monkeypatch.setattr(browser.harness_ipc, "connect", Mock(return_value=(client, "token")))
+    request = Mock(return_value={"result": {"targetInfos": []}})
+    monkeypatch.setattr(browser.harness_ipc, "request", request)
+    result = browser._cdp("Target.getTargets", daemon_name="job-patrol")
+    assert result == {"targetInfos": []}
+    browser.harness_ipc.connect.assert_called_once_with("job-patrol", timeout=5.0)
+    request.assert_called_once_with(
+        client,
+        "token",
+        {"method": "Target.getTargets", "params": {}, "session_id": None},
+    )
+    client.close.assert_called_once_with()
+
+
 def test_executor_rejects_a_stale_page_before_browser_input(monkeypatch):
     import jev_ultrafast.browser as browser
 

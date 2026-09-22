@@ -11,7 +11,7 @@ import os
 import sys
 import time
 
-from . import launcher, supervisor
+from . import job_patrol, launcher, supervisor
 from . import session as sessions
 
 CHECKPOINTS_PER_LEG = 6
@@ -72,8 +72,17 @@ def _show(report: dict, say=_say) -> None:
             _say(f"   ■ {entry['terminal']} ({entry['confidence']:.2f})")
 
 
-def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
-        allow_commit: bool = True, say=None, ask=None, should_stop=None) -> dict:
+def run(
+    need: str,
+    url: str | None = None,
+    chunk: int = 6,
+    max_steps: int = 40,
+    allow_commit: bool = True,
+    say=None,
+    ask=None,
+    should_stop=None,
+    mode: str = "standard",
+) -> dict:
     # The CLI talks to a terminal and the web UI talks to a browser; the loop itself should not
     # care which, and must never reach for stdin on its own.
     say = say or _say
@@ -83,11 +92,24 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
     should_stop = should_stop or (lambda: False)
     started = time.time()
     sessions.load_env()
+    platform = None
+    if mode == job_patrol.MODE:
+        if not url:
+            raise ValueError("job_patrol 必须提供一个明确的招聘平台起始 URL")
+        platform = job_patrol.require_platform_url(url)
+        chunk = min(max(1, int(chunk)), 2)
+        max_steps = min(max(1, int(max_steps)), 20)
+        allow_commit = False
+        browser = sessions.prepare(mode)
+    elif mode == "standard":
+        browser = launcher.describe()
+    else:
+        raise ValueError(f"Unknown autopilot mode: {mode}")
     say(f"需求: {need}")
     say(f"监督模型: {supervisor.model_name()}    填值模型: {os.environ.get('TEXT_MODEL', '?')}")
     # Which browser this drives decides whether half the web is even reachable, so it is the
     # first thing the log says rather than something to infer from a wall of login pages.
-    say(f"浏览器: {launcher.describe()['note']}")
+    say(f"浏览器: {browser['note']}")
     say("规划中…")
     try:
         plan = supervisor.plan(need, url)
@@ -96,11 +118,22 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
             raise
         say(f"   ⚠ 规划失败（{type(exc).__name__}），退回单段模式。")
         plan = {"start_url": url, "legs": [{"goal": need}]}
+    if mode == job_patrol.MODE:
+        # The supervisor may propose a different site. A patrol stays on the exact platform the
+        # caller named and never treats another recruiting site as a fallback.
+        plan["start_url"] = url
     legs = plan["legs"]
     for i, leg in enumerate(legs, 1):
         say(f"   {i}. {leg['goal']}")
 
-    session = sessions.start(plan["start_url"], legs[0]["goal"])
+    session = sessions.start(
+        plan["start_url"],
+        legs[0]["goal"],
+        mode=mode,
+        allowed_platform=platform,
+        action_delay_s=2.0 if mode == job_patrol.MODE else 0,
+        step_budget=max_steps,
+    )
     say(f"\n会话 {session.id} @ {plan['start_url']}")
     collected: dict = {}
     trace: list = []
@@ -109,6 +142,7 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
     index = 0
     finished = False
     declined: list = []
+    platform_stop: dict | None = None
 
     try:
         while index < len(legs) and session.total_steps < max_steps:
@@ -117,7 +151,7 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                 break
             say(f"\n── leg {index + 1}/{len(legs)}: {legs[index]['goal']}")
             idle = 0
-            hops = NAVIGATIONS_PER_LEG
+            hops = 0 if mode == job_patrol.MODE else NAVIGATIONS_PER_LEG
             for _ in range(CHECKPOINTS_PER_LEG):
                 if should_stop():
                     break
@@ -126,17 +160,41 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                 approved = None
                 _show(report, say)
                 _collect(collected, session)
-                trace.append({"leg": index + 1, "stop_reason": report["stop_reason"],
-                              "steps": report["steps_executed"]})
+                trace.append({
+                    "leg": index + 1,
+                    "stop_reason": report["stop_reason"],
+                    "steps": report["steps_executed"],
+                    "blocked_reason": report.get("blocked_reason"),
+                })
                 stop = report["stop_reason"]
                 pending = report.get("pending_decision") or {}
                 say(f"   ⟂ {stop}")
 
+                if mode == job_patrol.MODE and stop in {"platform_blocked", "left_platform"}:
+                    platform_stop = {
+                        "reason": stop,
+                        "detail": report.get("blocked_reason"),
+                        "url": report.get("observation", {}).get("url"),
+                    }
+                    say(f"   ⛔ {platform_stop['detail']}")
+                    say("      本轮停止该平台，不换站点、账号、IP 或工具继续访问。")
+                    finished = True
+                    break
+
                 if stop == "blocked_action":
                     say(f"   ⛔ {pending.get('gate_reason', '')}")
+                    declined.append(_refusal(index, report, pending, "只读门禁拒绝"))
+                    if mode == job_patrol.MODE:
+                        platform_stop = {
+                            "reason": "read_only_action",
+                            "detail": pending.get("gate_reason"),
+                            "url": report.get("observation", {}).get("url"),
+                        }
+                        say("      岗位巡检不会人工补做或批准该动作，本次运行到此为止。")
+                        finished = True
+                        break
                     say("      这类字段不代填。请在 Chrome 里自己填好。")
                     if not ask("      填好了，继续这一段？"):
-                        declined.append(_refusal(index, report, pending, "字段涉及机密，不代填"))
                         break
                     continue
 
@@ -147,6 +205,13 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
                     if not allow_commit:
                         say("      未获授权执行提交类动作，停在这里。")
                         declined.append(_refusal(index, report, pending, "未获授权"))
+                        if mode == job_patrol.MODE:
+                            platform_stop = {
+                                "reason": "read_only_action",
+                                "detail": pending.get("gate_reason"),
+                                "url": report.get("observation", {}).get("url"),
+                            }
+                            finished = True
                         break
                     if ask("      执行这个动作？"):
                         approved = pending.get("target_label")
@@ -220,6 +285,10 @@ def run(need: str, url: str | None = None, chunk: int = 6, max_steps: int = 40,
 
     return {
         "need": need,
+        "mode": mode,
+        "platform": platform,
+        "browser": browser,
+        "platform_stop": platform_stop,
         "start_url": plan["start_url"],
         "legs": legs,
         "total_steps": session.total_steps,
@@ -240,11 +309,17 @@ def main():
     parser.add_argument("--max-steps", type=int, default=40, help="整个任务的动作上限（默认 40）")
     parser.add_argument("--no-commit", action="store_true",
                         help="只读运行：遇到提交类动作直接拒绝，不询问")
+    parser.add_argument(
+        "--job-patrol",
+        action="store_true",
+        help="招聘平台只读巡检：固定单平台、复用用户 Chrome、限速并在风险信号处停止",
+    )
     parser.add_argument("--json", dest="json_path", default=None, help="把完整记录写到这个文件")
     args = parser.parse_args()
 
     result = run(args.need, url=args.url, chunk=args.chunk, max_steps=args.max_steps,
-                 allow_commit=not args.no_commit)
+                 allow_commit=not args.no_commit,
+                 mode=job_patrol.MODE if args.job_patrol else "standard")
     for item in result.get("declined", []):
         _say(f"⛔ 未执行: {item['operation']} → {item['target_label']}  ({item['why']})  {item['url']}")
     if args.json_path:

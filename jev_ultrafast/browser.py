@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 
+from browser_harness import _ipc as harness_ipc
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
@@ -17,12 +18,29 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+def _cdp(method, session_id=None, daemon_name=None, **params):
+    """Use Browser Harness's default daemon or an explicitly isolated named daemon."""
+    if daemon_name is None:
+        return cdp(method, session_id=session_id, **params)
+    client, token = harness_ipc.connect(daemon_name, timeout=5.0)
+    try:
+        client.settimeout(60.0 if method == "Page.captureScreenshot" else 5.0)
+        request = {"method": method, "params": params, "session_id": session_id}
+        response = harness_ipc.request(client, token, request)
+    finally:
+        client.close()
+    if "error" in response:
+        raise RuntimeError(response["error"])
+    return response.get("result", {})
+
+
 class Browser:
-    def __init__(self, url):
-        ensure_daemon()
+    def __init__(self, url, daemon_name=None, daemon_env=None):
+        ensure_daemon(name=daemon_name, env=daemon_env)
+        self.daemon_name = daemon_name
         self.opened = []
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-        self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        self.target = self._cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        self.session = self._cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.equip()
         self.call("Page.navigate", url=url)
         self.settle()
@@ -51,11 +69,13 @@ class Browser:
         """
         deadline = time.monotonic() + timeout
         while True:
-            for info in cdp("Target.getTargets")["targetInfos"]:
+            for info in self._cdp("Target.getTargets")["targetInfos"]:
                 if info.get("type") == "page" and info.get("openerId") == self.target:
                     self.opened.append(self.target)
                     self.target = info["targetId"]
-                    self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+                    self.session = self._cdp(
+                        "Target.attachToTarget", targetId=self.target, flatten=True
+                    )["sessionId"]
                     self.after_input = None
                     self.equip()
                     # A fresh popup is "complete" while still on about:blank; settling there would
@@ -75,7 +95,10 @@ class Browser:
             time.sleep(0.05)
 
     def call(self, method, **params):
-        return cdp(method, session_id=self.session, **params)
+        return self._cdp(method, session_id=self.session, **params)
+
+    def _cdp(self, method, session_id=None, **params):
+        return _cdp(method, session_id=session_id, daemon_name=self.daemon_name, **params)
 
     def evaluate(self, expression):
         response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
@@ -119,7 +142,12 @@ class Browser:
         for attempt in range(10):
             try:
                 return browser_operation(
-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
+                    {
+                        "operation": "observe",
+                        "session": self.session,
+                        "screenshot": screenshot,
+                        "daemon_name": self.daemon_name,
+                    }
                 )
             except StalePage:
                 if attempt == 9:
@@ -144,7 +172,13 @@ class Browser:
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
-        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
+        result = browser_operation({
+            "operation": "act",
+            "session": self.session,
+            "action": action,
+            "text": text,
+            "daemon_name": self.daemon_name,
+        })
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -152,7 +186,7 @@ class Browser:
         for target in [*self.opened, self.target]:
             if target:
                 try:
-                    cdp("Target.closeTarget", targetId=target)
+                    self._cdp("Target.closeTarget", targetId=target)
                 except Exception:
                     pass
         self.opened, self.target = [], None
@@ -168,7 +202,7 @@ def browser_operation(request):
     session = request["session"]
 
     def call(method, **params):
-        return cdp(method, session_id=session, **params)
+        return _cdp(method, session_id=session, daemon_name=request.get("daemon_name"), **params)
 
     def evaluate(expression):
         result = call("Runtime.evaluate", expression=expression, returnByValue=True)

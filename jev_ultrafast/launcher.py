@@ -11,14 +11,20 @@ import json
 import os
 import platform
 import subprocess
+import threading
 import time
 import urllib.request
 from pathlib import Path
+
+from browser_harness.admin import daemon_browser_kind, daemon_browser_ready
+from browser_harness.admin import ensure_daemon as ensure_harness_daemon
 
 # One Chrome binds 127.0.0.1, the next finds IPv4 taken and binds [::1]. Both are "port 9222".
 CDP_HOSTS = ("127.0.0.1", "[::1]", "localhost")
 
 HARNESS_PROFILE = Path.home() / ".config" / "browser-harness" / "chrome-profile"
+_HARNESS_ENV_LOCK = threading.Lock()
+_REMOTE_BROWSER_ENV = ("BU_CDP_URL", "BU_CDP_WS", "BU_BROWSER_ID")
 
 
 def _version(base: str, timeout: float = 1.5) -> dict | None:
@@ -236,12 +242,62 @@ def _note(connected: bool, wants_logins: bool) -> str:
     return "在用独立 profile，没有任何登录态；需要登录的站点会被门禁挡下。"
 
 
+def ensure_user_browser(
+    daemon_name: str,
+    daemon_env: dict[str, str],
+    ready_timeout_s: float = 20,
+) -> dict:
+    """Connect a named Browser Harness daemon to the user's visible local Chrome."""
+    # Browser Harness 0.1.13 checks both its explicit env and this process's env when deciding
+    # whether to run the local Chrome permission flow. Mask inherited remote endpoints only while
+    # starting the isolated named daemon, then restore them for ordinary sessions.
+    with _HARNESS_ENV_LOCK:
+        saved = {key: os.environ.pop(key) for key in _REMOTE_BROWSER_ENV if key in os.environ}
+        try:
+            ensure_harness_daemon(wait=20, name=daemon_name, env=daemon_env)
+        finally:
+            os.environ.update(saved)
+    # ensure_daemon may return as soon as the named IPC daemon is alive, while that daemon is
+    # still recreating its dedicated tab and CDP session after the previous patrol closed them.
+    # Treat that local state as transitional; a single immediate probe made every second platform
+    # fail even though the same visible Chrome became ready moments later.
+    deadline = time.monotonic() + max(0.0, float(ready_timeout_s))
+    kind = None
+    ready = False
+    while True:
+        kind = daemon_browser_kind(daemon_name)
+        ready = kind == "local" and daemon_browser_ready(daemon_name)
+        if ready:
+            break
+        if kind not in {None, "local"} or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    if not ready:
+        raise RuntimeError(
+            "job_patrol 必须通过 Browser Harness 连接用户自己的可见 Chrome；"
+            f"当前 daemon 类型为 {kind or 'unknown'}，browser_ready=false"
+        )
+    profile = default_user_data_dir()
+    return {
+        "endpoint": None,
+        "is_user_profile": True,
+        "profile_dir": str(profile) if profile else None,
+        "profile_has_logins": True,
+        "port_answered_by_someone_else": False,
+        "browser_kind": kind,
+        "daemon_name": daemon_name,
+        "note": "Browser Harness 已连接你当前可见的本地 Chrome，登录态可用。",
+    }
+
+
 def describe(port: int = 9222) -> dict:
     """What a run is actually about to drive — above all, whether it has the user's logins."""
     user = user_chrome_endpoint()
     any_cdp = cdp_endpoint(port)
-    profile = chosen_user_data_dir()
     real = default_user_data_dir()
+    # When identity verification proves the user's Chrome is connected, report that actual
+    # profile rather than the configured fallback that would be used for a future launch.
+    profile = real if user and real is not None else chosen_user_data_dir()
     return {
         "endpoint": user or any_cdp,
         "is_user_profile": bool(user),
