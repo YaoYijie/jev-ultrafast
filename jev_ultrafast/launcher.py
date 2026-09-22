@@ -16,8 +16,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-from browser_harness.admin import daemon_browser_kind, daemon_browser_ready
+from browser_harness.admin import daemon_browser_kind
 from browser_harness.admin import ensure_daemon as ensure_harness_daemon
+from browser_harness.admin import require_existing_daemon as require_harness_daemon
 
 # One Chrome binds 127.0.0.1, the next finds IPv4 taken and binds [::1]. Both are "port 9222".
 CDP_HOSTS = ("127.0.0.1", "[::1]", "localhost")
@@ -245,7 +246,6 @@ def _note(connected: bool, wants_logins: bool) -> str:
 def ensure_user_browser(
     daemon_name: str,
     daemon_env: dict[str, str],
-    ready_timeout_s: float = 20,
 ) -> dict:
     """Connect a named Browser Harness daemon to the user's visible local Chrome."""
     # Browser Harness 0.1.13 checks both its explicit env and this process's env when deciding
@@ -257,26 +257,18 @@ def ensure_user_browser(
             ensure_harness_daemon(wait=20, name=daemon_name, env=daemon_env)
         finally:
             os.environ.update(saved)
-    # ensure_daemon may return as soon as the named IPC daemon is alive, while that daemon is
-    # still recreating its dedicated tab and CDP session after the previous patrol closed them.
-    # Treat that local state as transitional; a single immediate probe made every second platform
-    # fail even though the same visible Chrome became ready moments later.
-    deadline = time.monotonic() + max(0.0, float(ready_timeout_s))
-    kind = None
-    ready = False
-    while True:
-        kind = daemon_browser_kind(daemon_name)
-        ready = kind == "local" and daemon_browser_ready(daemon_name)
-        if ready:
-            break
-        if kind not in {None, "local"} or time.monotonic() >= deadline:
-            break
-        time.sleep(0.1)
-    if not ready:
+    kind = daemon_browser_kind(daemon_name)
+    if kind != "local":
         raise RuntimeError(
             "job_patrol 必须通过 Browser Harness 连接用户自己的可见 Chrome；"
-            f"当前 daemon 类型为 {kind or 'unknown'}，browser_ready=false"
+            f"当前 daemon 类型为 {kind or 'unknown'}"
         )
+    # Browser Harness's connection_status also requires its previously attached tab to exist. Jev
+    # does not use that tab: every patrol creates and owns a fresh target. The old tab can therefore
+    # be gone while the browser transport is healthy (Target.getTargets succeeds), even though
+    # daemon_browser_ready reports false for the now-closed old tab. Verify the browser-level CDP
+    # transport instead, or every later patrol is rejected before it can create its own tab.
+    require_harness_daemon(daemon_name)
     profile = default_user_data_dir()
     return {
         "endpoint": None,

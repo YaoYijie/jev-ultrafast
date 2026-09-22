@@ -127,34 +127,46 @@ class BrowserHarnessUserProfile(unittest.TestCase):
         with mock.patch.dict("os.environ", {"BU_CDP_URL": "http://isolated.test:9222"}), \
                 mock.patch.object(launcher, "ensure_harness_daemon", side_effect=ensure_local) as ensure, \
                 mock.patch.object(launcher, "daemon_browser_kind", return_value="local"), \
-                mock.patch.object(launcher, "daemon_browser_ready", return_value=True):
+                mock.patch.object(launcher, "require_harness_daemon") as require:
             got = launcher.ensure_user_browser("patrol", {"BU_CDP_URL": ""})
             import os
             self.assertEqual(os.environ["BU_CDP_URL"], "http://isolated.test:9222")
         ensure.assert_called_once_with(wait=20, name="patrol", env={"BU_CDP_URL": ""})
+        require.assert_called_once_with("patrol")
         self.assertIsNone(seen["during"])
         self.assertTrue(got["is_user_profile"])
         self.assertEqual(got["browser_kind"], "local")
 
-    def test_remote_or_unhealthy_daemon_is_refused(self):
-        for kind, ready in [("cloud", True), ("cdp", True), ("local", False)]:
-            with self.subTest(kind=kind, ready=ready), \
+    def test_remote_daemon_is_refused_without_using_it(self):
+        for kind in (None, "cloud", "cdp"):
+            with self.subTest(kind=kind), \
                     mock.patch.object(launcher, "ensure_harness_daemon"), \
                     mock.patch.object(launcher, "daemon_browser_kind", return_value=kind), \
-                    mock.patch.object(launcher, "daemon_browser_ready", return_value=ready), \
+                    mock.patch.object(launcher, "require_harness_daemon") as require, \
                     self.assertRaises(RuntimeError):
-                launcher.ensure_user_browser("patrol", {}, ready_timeout_s=0)
+                launcher.ensure_user_browser("patrol", {})
+            require.assert_not_called()
 
-    def test_a_local_daemon_gets_a_brief_readiness_retry_between_patrols(self):
+    def test_a_local_daemon_without_an_attached_tab_is_still_valid(self):
+        with mock.patch.object(launcher, "ensure_harness_daemon"), \
+                mock.patch.object(launcher, "daemon_browser_kind", return_value="local"), \
+                mock.patch.object(launcher, "require_harness_daemon"), \
+                mock.patch(
+                    "browser_harness.admin.daemon_browser_ready", return_value=False
+                ) as tab_ready:
+            got = launcher.ensure_user_browser("patrol", {})
+        tab_ready.assert_not_called()
+        self.assertTrue(got["is_user_profile"])
+        self.assertEqual(got["browser_kind"], "local")
+
+    def test_an_unhealthy_local_browser_transport_is_refused(self):
         with mock.patch.object(launcher, "ensure_harness_daemon"), \
                 mock.patch.object(launcher, "daemon_browser_kind", return_value="local"), \
                 mock.patch.object(
-                    launcher, "daemon_browser_ready", side_effect=[False, True]
-                ) as ready:
-            got = launcher.ensure_user_browser("patrol", {})
-        self.assertEqual(ready.call_count, 2)
-        self.assertTrue(got["is_user_profile"])
-        self.assertEqual(got["browser_kind"], "local")
+                    launcher, "require_harness_daemon", side_effect=RuntimeError("unhealthy")
+                ), \
+                self.assertRaisesRegex(RuntimeError, "unhealthy"):
+            launcher.ensure_user_browser("patrol", {})
 
 
 class EnsuringChrome(PortFile):
