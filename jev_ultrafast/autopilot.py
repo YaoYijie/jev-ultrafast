@@ -51,14 +51,10 @@ def _refusal(index: int, report: dict, pending: dict, why: str) -> dict:
 
 
 def _collect(store: dict, session) -> None:
-    page = session.agent.state["page"]
-    url = page.get("url")
-    if not url or url.startswith("about:"):
-        return
-    text = page.get("text", "")
-    kept = store.get(url)
-    if kept is None or len(text) > len(kept["text"]):
-        store[url] = {"url": url, "title": page.get("title"), "text": text[:4000]}
+    for page in session.observed_pages:
+        # Multiple viewports/cities can share a URL. Keep their actual text and observed links.
+        key = json.dumps(page, ensure_ascii=False, sort_keys=True)
+        store.setdefault(key, page)
 
 
 def _show(report: dict, say=_say) -> None:
@@ -66,10 +62,10 @@ def _show(report: dict, say=_say) -> None:
         if "step" in entry:
             changed = "→" if entry["page_changed"] else "·"
             text = f"  «{entry['text']}»" if entry.get("text") else ""
-            _say(f"   {changed} [{entry['step']:2d}] {entry['operation']:11s} "
+            say(f"   {changed} [{entry['step']:2d}] {entry['operation']:11s} "
                  f"{entry['confidence']:.2f}  {entry['action'][:52]}{text}")
         else:
-            _say(f"   ■ {entry['terminal']} ({entry['confidence']:.2f})")
+            say(f"   ■ {entry['terminal']} ({entry['confidence']:.2f})")
 
 
 def run(
@@ -126,10 +122,19 @@ def run(
     for i, leg in enumerate(legs, 1):
         say(f"   {i}. {leg['goal']}")
 
+    if should_stop():
+        return {
+            "need": need, "mode": mode, "platform": platform, "browser": browser,
+            "platform_stop": None, "start_url": plan["start_url"], "legs": legs,
+            "total_steps": 0, "elapsed_s": round(time.time() - started, 1),
+            "visited": [], "trace": [], "declined": [], "answer": "已取消，未打开目标页面。",
+        }
+
     session = sessions.start(
         plan["start_url"],
         legs[0]["goal"],
         mode=mode,
+        screenshots=mode != job_patrol.MODE,
         allowed_platform=platform,
         action_delay_s=2.0 if mode == job_patrol.MODE else 0,
         step_budget=max_steps,
@@ -144,7 +149,30 @@ def run(
     declined: list = []
     platform_stop: dict | None = None
 
+    def checkpoint(report):
+        _show(report, say)
+        _collect(collected, session)
+        trace.append({
+            "leg": index + 1,
+            "stop_reason": report["stop_reason"],
+            "steps": report["steps_executed"],
+            "blocked_reason": report.get("blocked_reason"),
+            "error": report.get("error"),
+        })
+        if mode == job_patrol.MODE:
+            reason = report["stop_reason"]
+            if reason in {"platform_blocked", "left_platform", "blocked_action", "needs_confirmation",
+                          "error", "stale_page"}:
+                pending = report.get("pending_decision") or {}
+                return {
+                    "reason": "read_only_action" if reason in {"blocked_action", "needs_confirmation"} else reason,
+                    "detail": report.get("blocked_reason") or pending.get("gate_reason") or report.get("error"),
+                    "url": report.get("observation", {}).get("url"),
+                }
+        return None
+
     try:
+        _collect(collected, session)
         while index < len(legs) and session.total_steps < max_steps:
             if should_stop():
                 say("\n✗ 已取消，用已经读到的页面汇总。")
@@ -158,24 +186,14 @@ def run(
                 before = session.total_steps
                 report = session.step(steps=chunk, gated=True, approved=approved)
                 approved = None
-                _show(report, say)
-                _collect(collected, session)
-                trace.append({
-                    "leg": index + 1,
-                    "stop_reason": report["stop_reason"],
-                    "steps": report["steps_executed"],
-                    "blocked_reason": report.get("blocked_reason"),
-                })
+                platform_stop = checkpoint(report)
                 stop = report["stop_reason"]
                 pending = report.get("pending_decision") or {}
                 say(f"   ⟂ {stop}")
 
-                if mode == job_patrol.MODE and stop in {"platform_blocked", "left_platform"}:
-                    platform_stop = {
-                        "reason": stop,
-                        "detail": report.get("blocked_reason"),
-                        "url": report.get("observation", {}).get("url"),
-                    }
+                if platform_stop:
+                    if stop in {"blocked_action", "needs_confirmation"}:
+                        declined.append(_refusal(index, report, pending, "只读门禁拒绝"))
                     say(f"   ⛔ {platform_stop['detail']}")
                     say("      本轮停止该平台，不换站点、账号、IP 或工具继续访问。")
                     finished = True
@@ -184,15 +202,6 @@ def run(
                 if stop == "blocked_action":
                     say(f"   ⛔ {pending.get('gate_reason', '')}")
                     declined.append(_refusal(index, report, pending, "只读门禁拒绝"))
-                    if mode == job_patrol.MODE:
-                        platform_stop = {
-                            "reason": "read_only_action",
-                            "detail": pending.get("gate_reason"),
-                            "url": report.get("observation", {}).get("url"),
-                        }
-                        say("      岗位巡检不会人工补做或批准该动作，本次运行到此为止。")
-                        finished = True
-                        break
                     say("      这类字段不代填。请在 Chrome 里自己填好。")
                     if not ask("      填好了，继续这一段？"):
                         break
@@ -205,13 +214,6 @@ def run(
                     if not allow_commit:
                         say("      未获授权执行提交类动作，停在这里。")
                         declined.append(_refusal(index, report, pending, "未获授权"))
-                        if mode == job_patrol.MODE:
-                            platform_stop = {
-                                "reason": "read_only_action",
-                                "detail": pending.get("gate_reason"),
-                                "url": report.get("observation", {}).get("url"),
-                            }
-                            finished = True
                         break
                     if ask("      执行这个动作？"):
                         approved = pending.get("target_label")
@@ -239,17 +241,21 @@ def run(
                     verdict["action"] = "retarget" if verdict["goal"] else "next"
                 if verdict["action"] == "continue":
                     continue
-                if verdict["action"] == "force" and not pending:
+                if verdict["action"] == "force" and (not pending or stop != "low_confidence"):
                     # force only releases a held-back low-confidence choice. A weak supervisor
                     # reaches for it to mean "type something else", which it cannot do.
                     say("   ⚠ 没有被扣住的决策，force 无效，改为换目标。")
                     verdict["action"] = "retarget" if verdict["goal"] else "next"
                 if verdict["action"] == "force":
-                    approved = pending.get("target_label")
-                    report = session.step(steps=1, force=True, gated=True, approved=approved)
-                    approved = None
-                    _show(report, say)
-                    _collect(collected, session)
+                    # Confidence review is not permission to commit a newly chosen action.
+                    report = session.step(steps=1, force=True, gated=True)
+                    platform_stop = checkpoint(report)
+                    if platform_stop:
+                        if report["stop_reason"] in {"blocked_action", "needs_confirmation"}:
+                            declined.append(_refusal(index, report, report.get("pending_decision") or {},
+                                                     "只读门禁拒绝"))
+                        finished = True
+                        break
                     continue
                 if verdict["action"] == "navigate" and verdict["url"] and hops > 0:
                     say(f"   ↪ 换站点: {verdict['url']}")

@@ -8,13 +8,14 @@ TYPE_TEXT and a field value has to be written.
 """
 
 import base64
+import json
 import os
 import threading
 import time
 import uuid
 from pathlib import Path
 
-from . import guard, job_patrol, launcher
+from . import guard, job_patrol, launcher, ownership
 from .agent import Agent
 from .browser import StalePage
 from .launcher import ensure_chrome_running
@@ -105,6 +106,7 @@ class Session:
             browser_options = {
                 "daemon_name": job_patrol.DAEMON_NAME,
                 "daemon_env": job_patrol.DAEMON_ENV,
+                "strict_fresh": True,
             }
         self.agent = Agent(url, goal, screenshots=screenshots, browser_options=browser_options)
         self.created_at = time.time()
@@ -112,8 +114,8 @@ class Session:
         self.total_steps = 0
         self.mode = mode
         self.allowed_platform = allowed_platform
-        self.action_delay_s = max(0.0, float(action_delay_s))
-        self.step_budget = max(1, int(step_budget))
+        self.action_delay_s = max(2.0 if mode == job_patrol.MODE else 0.0, float(action_delay_s))
+        self.step_budget = max(1, min(int(step_budget), 20) if mode == job_patrol.MODE else int(step_budget))
         self.last_action_at: float | None = None
         self.blocked_reason: str | None = None
         self.shot_index = 0
@@ -123,6 +125,12 @@ class Session:
         self.rechecked_blocked = False
         self.last_error: str | None = None
         self.closed = False
+        self.patrol_stop_reason: str | None = None
+        self.observed_pages: list[dict] = []
+        self._observed_keys: set[str] = set()
+        self._remember_page(self.agent.state["page"])
+        if mode == job_patrol.MODE:
+            self.agent.page_guard = self._guard_page
 
     # -- internals -----------------------------------------------------------
 
@@ -135,6 +143,7 @@ class Session:
         while True:
             try:
                 state["page"] = self.agent.browser.observe(screenshot=self.agent.screenshots)
+                self._remember_page(state["page"])
                 return
             except StalePage as err:
                 if time.monotonic() >= deadline or "navigating" not in str(err).lower():
@@ -171,15 +180,54 @@ class Session:
             count += 1
         return count
 
+    def _remember_page(self, page):
+        # Keep every observed viewport, including intermediate pages inside one checkpoint.
+        # Replacing by URL loses SPA city changes and scrolling through the same result list.
+        if not page.get("url") or page["url"].startswith("about:"):
+            return
+        evidence = {k: page.get(k) for k in ("url", "title", "text", "links")}
+        evidence["text"] = (evidence["text"] or "")[:6000]
+        evidence["links"] = (evidence["links"] or [])[:250]
+        key = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+        if key not in self._observed_keys and len(self.observed_pages) < 256:
+            self._observed_keys.add(key)
+            self.observed_pages.append(evidence)
+
+    def _guard_page(self, page):
+        self._remember_page(page)
+        stopped = job_patrol.page_stop(page, self.allowed_platform)
+        if stopped:
+            self.patrol_stop_reason, self.blocked_reason = stopped
+            raise job_patrol.PatrolStopped(*stopped)
+
+    def _account_actions(self, before, executed):
+        # Agent logs input before observation. Even if that observation fails, the action counts
+        # toward the budget and the next input must still respect the pacing interval.
+        for entry in self.agent.state["history"][before:]:
+            self.total_steps += 1
+            self.last_action_at = time.monotonic()
+            executed.append({
+                "step": self.total_steps,
+                "operation": entry.get("operation"),
+                "action": (entry.get("action") or "")[:120],
+                "kind": entry.get("kind"),
+                "text": entry.get("text"),
+                "confidence": entry.get("confidence"),
+                "page_changed": entry.get("page_changed"),
+                "url": entry.get("url"),
+                "elapsed_ms": entry.get("elapsed_ms"),
+            })
+        self._remember_page(self.agent.state["page"])
+
     def _patrol_stop(self) -> str | None:
         if self.mode != job_patrol.MODE:
             return None
         if self.blocked_reason:
-            return "platform_blocked"
+            return getattr(self, "patrol_stop_reason", None) or "platform_blocked"
         stopped = job_patrol.page_stop(self.agent.state["page"], self.allowed_platform)
         if stopped:
-            stop, self.blocked_reason = stopped
-            return stop
+            self.patrol_stop_reason, self.blocked_reason = stopped
+            return self.patrol_stop_reason
         return None
 
     def _pace(self) -> None:
@@ -204,6 +252,7 @@ class Session:
             "text": text[:text_chars],
             "text_length": len(text),
             "text_truncated": len(text) > text_chars,
+            "links": page.get("links", [])[:elements],
             "elements": [
                 {k: e[k] for k in ("index", "label", "role", "value", "operations") if k in e}
                 for e in space[:elements]
@@ -233,6 +282,7 @@ class Session:
             retries = 0
             stop = None
 
+            steps = min(steps, 2) if self.mode == job_patrol.MODE else steps
             while len(executed) < max(1, steps):
                 patrol_stop = self._patrol_stop()
                 if patrol_stop:
@@ -249,6 +299,9 @@ class Session:
 
                 try:
                     agent.command("predict", {})
+                except job_patrol.PatrolStopped as exc:
+                    stop = exc.reason
+                    break
                 except StalePage:
                     if retries >= STALE_RETRIES:
                         stop = "stale_page"
@@ -265,6 +318,11 @@ class Session:
                     stop, self.last_error = "error", str(exc)
                     break
 
+                self._remember_page(agent.state["page"])
+                patrol_stop = self._patrol_stop()
+                if patrol_stop:
+                    stop = patrol_stop
+                    break
                 decision = dict(agent.state["decision"])
                 page = agent.state["page"]
                 if (
@@ -280,12 +338,14 @@ class Session:
                     continue
                 chosen = next((a for a in page["actions"] if a["id"] == decision["choice"]), None)
                 soft = chosen is not None and chosen.get("kind") in SOFT_KINDS
-                if gated:
+                if gated or self.mode == job_patrol.MODE:
                     verdict, reason = guard.gate(decision, chosen, page, mode=self.mode)
                     approved_this = approved is not None and chosen is not None and approved == chosen.get("label")
                     if verdict == guard.BLOCK or (verdict == guard.CONFIRM and not approved_this):
                         stop = "blocked_action" if verdict == guard.BLOCK else "needs_confirmation"
                         self.pending_decision = {**_decision_view(decision, page), "gate_reason": reason}
+                        if self.mode == job_patrol.MODE:
+                            self.patrol_stop_reason, self.blocked_reason = "blocked_action", reason
                         break
                     approved = None
                 if not force and not soft and decision["confidence"] < min_confidence:
@@ -297,18 +357,27 @@ class Session:
                     break
 
                 before = len(agent.state["history"])
+                stale = False
                 try:
                     agent.command("act", {"fingerprint": page["fingerprint"]})
                 except StalePage:
+                    stale = True
+                except (ValueError, RuntimeError) as exc:
+                    stop, self.last_error = "error", str(exc)
+                finally:
+                    self._account_actions(before, executed)
+                if stop:
+                    break
+                if stale:
                     if retries >= STALE_RETRIES:
                         stop = "stale_page"
                         break
                     retries += 1
                     self._reobserve()
+                    stop = self._patrol_stop()
+                    if stop:
+                        break
                     continue
-                except (ValueError, RuntimeError) as exc:
-                    stop, self.last_error = "error", str(exc)
-                    break
 
                 retries = 0
                 if len(agent.state["history"]) == before:
@@ -323,23 +392,7 @@ class Session:
                     stop = agent.state["status"]
                     break
 
-                entry = agent.state["history"][-1]
-                self.total_steps += 1
-                self.last_action_at = time.monotonic()
-                executed.append(
-                    {
-                        "step": self.total_steps,
-                        "operation": entry.get("operation"),
-                        "action": (entry.get("action") or "")[:120],
-                        "kind": entry.get("kind"),
-                        "text": entry.get("text"),
-                        "confidence": entry.get("confidence"),
-                        "page_changed": entry.get("page_changed"),
-                        "url": entry.get("url"),
-                        "screenshot_path": self._save_shot(),
-                        "elapsed_ms": entry.get("elapsed_ms"),
-                    }
-                )
+                executed[-1]["screenshot_path"] = self._save_shot()
                 patrol_stop = self._patrol_stop()
                 if patrol_stop:
                     stop = patrol_stop
@@ -363,6 +416,8 @@ class Session:
         with self.lock:
             if self.closed:
                 raise ValueError(f"Session {self.id} is closed. Start a new one.")
+            if self._patrol_stop():
+                raise ValueError(f"Patrol has stopped: {self.blocked_reason}")
             goal = goal.strip()
             if not goal:
                 raise ValueError("Supply a goal")
@@ -395,6 +450,8 @@ class Session:
             if not url.startswith(("http://", "https://")):
                 raise ValueError("navigate needs an http(s) URL")
             if self.mode == job_patrol.MODE:
+                if self._patrol_stop():
+                    raise ValueError(f"Patrol has stopped: {self.blocked_reason}")
                 job_patrol.require_platform_url(url, self.allowed_platform)
             self.touched_at = time.time()
             browser = self.agent.browser
@@ -405,12 +462,13 @@ class Session:
                 state["goal"] = goal.strip()
                 state["plan"] = [state["goal"]]
                 state["plan_index"] = 0
-            browser.after_input = None
-            browser.call("Page.navigate", url=url)
-            browser.settle()
+            self._pace()
+            browser.navigate(url)
+            self.last_action_at = time.monotonic()
             state["decision"] = None
             state["status"] = "ready"
             state["page"] = browser.observe(screenshot=self.agent.screenshots)
+            self._remember_page(state["page"])
             self.pending_decision = None
             self.rechecked_blocked = False
             self.legs.append({"goal": state["goal"], "started_at_step": self.total_steps})
@@ -418,14 +476,21 @@ class Session:
 
     def close(self) -> dict:
         with self.lock:
-            report = self._report("finished", [])
-            if not self.closed:
-                self.closed = True
-                try:
-                    self.agent.close()
-                except Exception as exc:  # a dead tab must not block cleanup
-                    report["close_error"] = str(exc)
-            return report
+            report = {}
+            try:
+                report = self._report("finished", [])
+                return report
+            finally:
+                if not self.closed:
+                    self.closed = True
+                    try:
+                        self.agent.close()
+                    except Exception as exc:  # a dead tab must not block cleanup
+                        report["close_error"] = str(exc)
+                    finally:
+                        lease = getattr(self, "_browser_lease", None)
+                        if lease is not None:
+                            lease.close()
 
     def _granularity_advice(self, stop_reason: str, executed: list[dict]) -> str | None:
         """Tell the host when its sub-goal left Jev nothing to choose.
@@ -519,13 +584,13 @@ NEXT_HINTS = {
 # -- registry ----------------------------------------------------------------
 
 
-def _reap(now: float | None = None) -> None:
+def _reap(now: float | None = None, *, capacity: bool = True) -> None:
     now = now or time.time()
     stale = [s for s in _REGISTRY.values() if now - s.touched_at > IDLE_TIMEOUT_S]
     for session in stale:
         session.close()
         _REGISTRY.pop(session.id, None)
-    if len(_REGISTRY) >= MAX_LIVE_SESSIONS:
+    if capacity and len(_REGISTRY) >= MAX_LIVE_SESSIONS:
         for session in sorted(_REGISTRY.values(), key=lambda s: s.touched_at)[
             : len(_REGISTRY) - MAX_LIVE_SESSIONS + 1
         ]:
@@ -555,20 +620,28 @@ def start(
 ) -> Session:
     if mode == job_patrol.MODE:
         allowed_platform = job_patrol.require_platform_url(url, allowed_platform)
-    prepare(mode)
     with _REGISTRY_LOCK:
-        _reap()
-        session = Session(
-            url,
-            goal,
-            screenshots=screenshots,
-            mode=mode,
-            allowed_platform=allowed_platform,
-            action_delay_s=action_delay_s,
-            step_budget=step_budget,
-        )
-        _REGISTRY[session.id] = session
-        return session
+        _reap(capacity=False)
+    lease = ownership.acquire(ARTIFACTS.parent / "browser.lock", exclusive=mode == job_patrol.MODE)
+    try:
+        prepare(mode)
+        with _REGISTRY_LOCK:
+            _reap()
+            session = Session(
+                url,
+                goal,
+                screenshots=screenshots,
+                mode=mode,
+                allowed_platform=allowed_platform,
+                action_delay_s=action_delay_s,
+                step_budget=step_budget,
+            )
+            session._browser_lease = lease
+            _REGISTRY[session.id] = session
+            return session
+    except BaseException:
+        lease.close()
+        raise
 
 
 def get(session_id: str) -> Session:
@@ -581,14 +654,16 @@ def get(session_id: str) -> Session:
 
 def finish(session_id: str) -> dict:
     session = get(session_id)
-    report = session.close()
-    with _REGISTRY_LOCK:
-        _REGISTRY.pop(session_id, None)
-    return report
+    try:
+        return session.close()
+    finally:
+        with _REGISTRY_LOCK:
+            _REGISTRY.pop(session_id, None)
 
 
 def live() -> list[dict]:
     with _REGISTRY_LOCK:
+        _reap(capacity=False)
         return [
             {
                 "session_id": s.id,

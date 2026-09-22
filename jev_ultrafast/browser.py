@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from browser_harness import _ipc as harness_ipc
-from browser_harness.admin import ensure_daemon
+from browser_harness.admin import ensure_daemon, require_existing_daemon
 from browser_harness.helpers import cdp
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
@@ -35,14 +35,31 @@ def _cdp(method, session_id=None, daemon_name=None, **params):
 
 
 class Browser:
-    def __init__(self, url, daemon_name=None, daemon_env=None):
-        ensure_daemon(name=daemon_name, env=daemon_env)
+    def __init__(self, url, daemon_name=None, daemon_env=None, strict_fresh=False):
+        if daemon_name is None:
+            ensure_daemon(env=daemon_env)
+        else:
+            # A named connection has already been prepared and identity-checked. Do not silently
+            # replace it with a different Chrome if it dies between preflight and tab creation.
+            require_existing_daemon(daemon_name)
         self.daemon_name = daemon_name
+        self.strict_fresh = strict_fresh
         self.opened = []
-        self.target = self._cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-        self.session = self._cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.equip()
-        self.call("Page.navigate", url=url)
+        self.target = None
+        try:
+            self.target = self._cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+            self.session = self._cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+            self.equip()
+            self.navigate(url)
+        except Exception:
+            self.close()
+            raise
+
+    def navigate(self, url):
+        self.after_input = None
+        result = self.call("Page.navigate", url=url)
+        if result.get("errorText"):
+            raise RuntimeError(f"Navigation failed: {result['errorText']}")
         self.settle()
 
     def equip(self):
@@ -156,7 +173,8 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
-        if action is not None and action["kind"] in {"click", "select"}:
+        if (not getattr(self, "strict_fresh", False)
+                and action is not None and action["kind"] in {"click", "select"}):
             node = action["node"]
             if type(node) is not int:
                 return False

@@ -2,6 +2,16 @@
 
 from urllib.parse import parse_qsl, urlparse
 
+
+class PatrolStopped(ValueError):
+    """A terminal platform condition observed before any further browser input."""
+
+    def __init__(self, reason, detail):
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
 MODE = "job_patrol"
 DAEMON_NAME = "jev-job-patrol"
 # Empty values override any inherited remote or dedicated-CDP configuration in the named daemon.

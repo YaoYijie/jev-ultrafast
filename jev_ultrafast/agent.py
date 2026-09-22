@@ -79,6 +79,8 @@ class Agent:
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["decision"] = None
+            if getattr(self, "page_guard", None):
+                self.page_guard(state["page"])
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:

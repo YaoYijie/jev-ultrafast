@@ -5,7 +5,9 @@ checkpoints these tools stop at, and reads the page itself — it never scripts 
 model summarises the page on the way back.
 """
 
+import hashlib
 import json
+from pathlib import Path
 from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -20,8 +22,24 @@ sessions.load_env()
 mcp = MCPServer("jev-ultrafast")
 
 
+def _source_id():
+    root = Path(__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted([*root.glob("*.py"), root / "snapshot.js"]):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+_LOADED_SOURCE_ID = _source_id()
+
+
+def _runtime_info():
+    return {"loaded_source_id": _LOADED_SOURCE_ID, "current_source_id": _source_id()}
+
+
 def _dump(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return json.dumps({**payload, "runtime": _runtime_info()}, ensure_ascii=False, indent=2)
 
 
 def _fail(exc: Exception) -> str:
@@ -226,6 +244,10 @@ def auto_start(need: str, url: str = "", mode: Literal["standard", "job_patrol"]
         JSON with run_id and what to call next.
     """
     try:
+        if _LOADED_SOURCE_ID != _source_id():
+            raise RuntimeError("source_changed: Jev 源码已更新，当前 MCP 进程仍是旧版本；重新连接 MCP 后再运行")
+        if not (need or "").strip():
+            raise ValueError("需求不能为空")
         if mode == job_patrol.MODE:
             if not url:
                 raise ValueError("job_patrol 必须提供一个明确的招聘平台起始 URL")
@@ -277,7 +299,7 @@ def auto_result(run_id: str, page_text: bool = False) -> str:
 
     Args:
         run_id: From auto_start or auto_list.
-        page_text: Include up to 4000 characters of each visited page. Off by default because a
+        page_text: Include up to 6000 characters of each visited viewport. Off by default because a
             dozen pages will fill your context; turn it on when the report is not enough and you
             want to check a claim against the page it came from.
 

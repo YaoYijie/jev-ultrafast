@@ -60,6 +60,7 @@
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    if (e.tagName==='A' && /^https?:/.test(e.href)) base.href=e.href;
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
@@ -102,6 +103,7 @@
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
-  return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
+  const links=actions.filter(a=>a.href).map(a=>({label:a.label,url:a.href}));
+  return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,links,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
 })()

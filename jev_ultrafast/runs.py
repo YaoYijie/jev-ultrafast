@@ -244,13 +244,20 @@ def load(run_id: str) -> dict:
 
 
 def poll(run_id: str, since: int = 0) -> dict:
-    run = get(run_id)
+    try:
+        run = get(run_id)
+    except KeyError:
+        record = load(run_id)
+        lines = record.get("lines", [])
+        offset = min(len(lines), max(0, since))
+        return {**{k: v for k, v in record.items() if k not in {"visited", "trace"}},
+                "lines": lines[offset:], "next_line": len(lines), "question": None}
     with run.lock:
         lines = run.lines[max(0, since):]
         return {
             **run.summary(),
             "lines": lines,
-            "next_line": max(0, since) + len(lines),
+            "next_line": len(run.lines),
             "question": run.question,
             "answer": run.result.get("answer") if run.result else None,
         }

@@ -104,8 +104,15 @@ This mode uses the user's visible Chrome profile, stays on the platform named by
 run at 20 actions with two actions per checkpoint, and waits between actions. It blocks applying,
 messaging, saving, following, login and verification actions. A CAPTCHA, abnormal-account/IP
 message, login wall, 401/403/429 page, or navigation to another site ends the run. Run only one
-platform at a time. Scheduled or unattended market monitoring should use public search indexes and
-company career sites instead.
+platform at a time; an OS lock also prevents overlap between separate MCP processes. Scheduled or
+unattended market monitoring should use public search indexes and company career sites instead.
+
+MCP callers use `auto_start(..., mode="job_patrol")`, then `auto_poll` and `auto_result`.
+Results retain each observed viewport and its visible links, including pages between checkpoints.
+A stopped patrol cannot be resumed by changing its goal or forcing a low-confidence choice.
+Each MCP response includes the loaded and current source IDs. After a code update, reconnect the
+MCP process before starting another run; this is not hot reload. Processes started before this
+version have no version field and also need reconnecting.
 
 ## Why it moves
 
@@ -151,7 +158,7 @@ node --check jev_ultrafast/snapshot.js
 uv build
 ```
 
-Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls. Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
+Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls. `uv run python scripts/check_patrol.py` checks the real MCP → run → session → existing Chrome path against loopback pages, with deterministic model fixtures. It requires the user Chrome connection but makes no model API calls and visits no recruiting sites. See [job-patrol-validation.md](docs/job-patrol-validation.md) for coverage and limits. Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
 
 ---
 
