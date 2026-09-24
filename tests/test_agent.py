@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from jev_ultrafast import agent as loop
-from jev_ultrafast import model
+from jev_ultrafast import model, supervisor
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
 
 
@@ -149,6 +149,25 @@ def test_quoted_task_text_still_uses_the_llm(monkeypatch):
     assert post.call_count == 1
     sent = json.loads(post.call_args.args[2]["messages"][1]["content"])
     assert sent["goal"] == 'Fly from "Zurich" to London'
+
+
+def test_field_text_base_url_strips_chat_completions_suffix(monkeypatch):
+    post = Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "fake-key")
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://api.example.com/v1/chat/completions/")
+    context = model.field_context('Fly from "Zurich" to London', page()["actions"][0], page(), [])
+    model.field_text(context)
+    assert post.call_args.args[0] == "https://api.example.com/v1/chat/completions"
+
+
+def test_supervisor_base_url_strips_chat_completions_suffix(monkeypatch):
+    post = Mock(return_value={"choices": [{"message": {"content": '{"ok": true}'}}]})
+    monkeypatch.setattr(supervisor, "post_json", post)
+    monkeypatch.setenv("SUPERVISOR_API_KEY", "fake-key")
+    monkeypatch.setenv("SUPERVISOR_BASE_URL", "https://api.example.com/v1/chat/completions/")
+    supervisor._chat("system prompt", "user payload")
+    assert post.call_args.args[0] == "https://api.example.com/v1/chat/completions"
 
 
 def test_missing_text_credential_stops_before_guessing(monkeypatch):

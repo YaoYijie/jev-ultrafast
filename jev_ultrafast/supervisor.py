@@ -96,7 +96,7 @@ def _chat(system: str, payload, as_json: bool = True, max_tokens: int = 2048) ->
     base = (
         os.environ.get("SUPERVISOR_BASE_URL")
         or os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1")
-    ).rstrip("/")
+    ).rstrip("/").removesuffix("/chat/completions").rstrip("/")
     body = {
         "model": model_name(),
         "max_tokens": max_tokens,
